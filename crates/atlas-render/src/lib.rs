@@ -15,11 +15,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod anatomy;
 pub mod camera;
 pub mod streamlines;
 pub mod surfaces_and_glyphs;
 pub mod wgpu_pipeline;
 
+pub use anatomy::{
+    build_species_anatomy, generate_2d_slice_contours, AnatomicalLandmark, AnatomicalLayer,
+    AnatomicalMesh, SliceContour, SpeciesAnatomyScene,
+};
 pub use camera::{FlyThroughController, OrbitCamera, ViewPreset};
 pub use streamlines::{
     generate_arched_tract_curve, generate_braided_fascicle_bundle, ColorSchemeMode,

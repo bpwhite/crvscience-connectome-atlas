@@ -45,7 +45,7 @@ struct Cli {
     #[arg(long)]
     headless_screenshot: Option<PathBuf>,
 
-    /// Select preset view (1=Human MNI152, 2=Drosophila Matrix, 3=C. elegans Hubs) for --headless-screenshot
+    /// Select preset view (1=Human MNI152, 2=Drosophila FlyWire, 3=C. elegans WormAtlas, 4=Mouse CCFv3) for --headless-screenshot
     #[arg(long, default_value_t = 1)]
     screenshot_view: u8,
 

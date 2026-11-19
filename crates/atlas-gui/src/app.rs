@@ -20,11 +20,14 @@ use atlas_core::{
 use atlas_io::{parse_nifti1_header, parse_swc_morphology, parse_trk_streamlines, AtlasVault};
 use atlas_io::{format_swc_document, generate_region_swc_arbor};
 use atlas_render::{
-    compute_atlas_fiber_tensors, generate_arched_tract_curve, generate_braided_fascicle_bundle,
-    is_point_clipped_by_cutaway, ColorSchemeMode, FlyThroughController, LocalFiberTensor,
-    OrbitCamera, SurgicalCutawayMode, TractRenderStyle, ViewPreset,
+    build_species_anatomy, compute_atlas_fiber_tensors, generate_2d_slice_contours,
+    generate_arched_tract_curve, generate_braided_fascicle_bundle, is_point_clipped_by_cutaway,
+    AnatomicalLayer, ColorSchemeMode, FlyThroughController, LocalFiberTensor, OrbitCamera,
+    SpeciesAnatomyScene, SurgicalCutawayMode, TractRenderStyle, ViewPreset,
 };
+use eframe::egui::epaint::{Mesh as EguiMesh, Vertex as EguiVertex, WHITE_UV};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use glam::Vec3;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,10 +57,13 @@ pub struct ConnectomeAtlasApp {
     topology_tda: TopologyTdaReport,
     domain_decode: Vec<DomainDecodeEntry>,
     fiber_tensors: Vec<LocalFiberTensor>,
+    anatomy_scene: SpeciesAnatomyScene,
     tract_style: TractRenderStyle,
     cutaway_mode: SurgicalCutawayMode,
     cutaway_offset_mm: f32,
     show_tensor_glyphs: bool,
+    show_internal_organs: bool,
+    show_anatomical_labels: bool,
     fly_ctrl: FlyThroughController,
     receptor_channel: String,
     agonist_gain: f64,
@@ -120,6 +126,7 @@ impl ConnectomeAtlasApp {
         let topology_tda = atlas.compute_topology_tda_report(0.0);
         let domain_decode = atlas.decode_functional_domains(None, 0.0);
         let fiber_tensors = compute_atlas_fiber_tensors(&atlas, 0.0);
+        let anatomy_scene = build_species_anatomy(&atlas.id);
         let selected_region = atlas.regions.first().map(|r| r.id.clone());
         let (path_source, path_target) = if active_preset_idx == 0 {
             (
@@ -138,6 +145,14 @@ impl ConnectomeAtlasApp {
         };
         let cmd_entries = build_command_index(&atlas);
         let vault = AtlasVault::open(db_path).ok();
+        let camera = OrbitCamera {
+            yaw_rad: anatomy_scene.default_yaw,
+            pitch_rad: anatomy_scene.default_pitch,
+            distance: anatomy_scene.default_distance,
+            target: Vec3::from_array(anatomy_scene.default_target),
+            ..OrbitCamera::default()
+        };
+        let default_slice = anatomy_scene.default_slice;
 
         Self {
             presets,
@@ -151,27 +166,30 @@ impl ConnectomeAtlasApp {
             topology_tda,
             domain_decode,
             fiber_tensors,
+            anatomy_scene,
             tract_style: TractRenderStyle::BraidedFascicles,
             cutaway_mode: SurgicalCutawayMode::AnteriorSuperiorOctant,
             cutaway_offset_mm: 0.0,
             show_tensor_glyphs: true,
+            show_internal_organs: true,
+            show_anatomical_labels: true,
             fly_ctrl: FlyThroughController::default(),
             receptor_channel: "ht".to_string(),
             agonist_gain: 0.0,
             harmonic_mode_idx: 1,
-            camera: OrbitCamera::default(),
+            camera,
             color_mode: ColorSchemeMode::FunctionalNetwork,
             probe_mode: ProbeMode::Inspect,
             right_tab: RightTab::Inspector,
             min_weight: 0.0,
-            shell_opacity: 0.22,
+            shell_opacity: 0.45,
             flow_speed: 0.28,
             tonic_phase: 0.0,
             conduction_velocity_m_s: 9.6,
             show_slice_planes: true,
-            slice_x_mm: 1.0,
-            slice_y_mm: 55.0,
-            slice_z_mm: -3.0,
+            slice_x_mm: default_slice[0],
+            slice_y_mm: default_slice[1],
+            slice_z_mm: default_slice[2],
             selected_region,
             path_source,
             path_target,
@@ -202,6 +220,7 @@ impl ConnectomeAtlasApp {
         let topology_tda = atlas.compute_topology_tda_report(0.0);
         let domain_decode = atlas.decode_functional_domains(None, 0.0);
         let fiber_tensors = compute_atlas_fiber_tensors(&atlas, 0.0);
+        let anatomy_scene = build_species_anatomy(&atlas.id);
         let selected_region = atlas.regions.first().map(|r| r.id.clone());
         let (path_source, path_target) = if idx == 0 {
             (
@@ -220,6 +239,14 @@ impl ConnectomeAtlasApp {
         };
         let cmd_entries = build_command_index(&atlas);
         let vault = AtlasVault::open_in_memory().ok();
+        let camera = OrbitCamera {
+            yaw_rad: anatomy_scene.default_yaw,
+            pitch_rad: anatomy_scene.default_pitch,
+            distance: anatomy_scene.default_distance,
+            target: Vec3::from_array(anatomy_scene.default_target),
+            ..OrbitCamera::default()
+        };
+        let default_slice = anatomy_scene.default_slice;
 
         Self {
             presets,
@@ -233,27 +260,30 @@ impl ConnectomeAtlasApp {
             topology_tda,
             domain_decode,
             fiber_tensors,
+            anatomy_scene,
             tract_style: TractRenderStyle::BraidedFascicles,
             cutaway_mode: SurgicalCutawayMode::AnteriorSuperiorOctant,
             cutaway_offset_mm: 0.0,
             show_tensor_glyphs: true,
+            show_internal_organs: true,
+            show_anatomical_labels: true,
             fly_ctrl: FlyThroughController::default(),
             receptor_channel: "ht".to_string(),
             agonist_gain: 0.0,
             harmonic_mode_idx: 1,
-            camera: OrbitCamera::default(),
+            camera,
             color_mode: ColorSchemeMode::FunctionalNetwork,
             probe_mode: ProbeMode::Inspect,
             right_tab: RightTab::Inspector,
             min_weight: 0.0,
-            shell_opacity: 0.22,
+            shell_opacity: 0.45,
             flow_speed: 0.0,
             tonic_phase: 0.15,
             conduction_velocity_m_s: 9.6,
             show_slice_planes: true,
-            slice_x_mm: 1.0,
-            slice_y_mm: 55.0,
-            slice_z_mm: -3.0,
+            slice_x_mm: default_slice[0],
+            slice_y_mm: default_slice[1],
+            slice_z_mm: default_slice[2],
             selected_region,
             path_source,
             path_target,
@@ -288,12 +318,24 @@ impl ConnectomeAtlasApp {
         }
     }
 
+    fn apply_species_framing(&mut self) {
+        self.anatomy_scene = build_species_anatomy(&self.atlas.id);
+        self.camera.target = Vec3::from_array(self.anatomy_scene.default_target);
+        self.camera.distance = self.anatomy_scene.default_distance;
+        self.camera.yaw_rad = self.anatomy_scene.default_yaw;
+        self.camera.pitch_rad = self.anatomy_scene.default_pitch;
+        self.slice_x_mm = self.anatomy_scene.default_slice[0];
+        self.slice_y_mm = self.anatomy_scene.default_slice[1];
+        self.slice_z_mm = self.anatomy_scene.default_slice[2];
+    }
+
     fn switch_preset(&mut self, idx: usize) {
         self.active_preset_idx = idx;
         self.atlas = self.presets[idx].clone();
         self.selected_region = self.atlas.regions.first().map(|r| r.id.clone());
         self.path_source = self.atlas.regions.first().map(|r| r.id.clone());
         self.path_target = self.atlas.regions.last().map(|r| r.id.clone());
+        self.apply_species_framing();
         self.recompute();
     }
 
@@ -320,6 +362,7 @@ impl ConnectomeAtlasApp {
                 Ok(env) => {
                     self.atlas = env.atlas;
                     self.selected_region = self.atlas.regions.first().map(|r| r.id.clone());
+                    self.apply_species_framing();
                     self.recompute();
                     self.status_msg = format!("Loaded envelope {}", path.display());
                 }
@@ -541,7 +584,7 @@ impl ConnectomeAtlasApp {
                                 if ui.add(egui::Slider::new(&mut self.min_weight, 0.0..=0.92).text("Min Weight")).changed() {
                                     self.recompute();
                                 }
-                                ui.add(egui::Slider::new(&mut self.shell_opacity, 0.0..=0.60).text("Shell Alpha"));
+                                ui.add(egui::Slider::new(&mut self.shell_opacity, 0.0..=0.85).text("Shell Alpha"));
                                 ui.add(egui::Slider::new(&mut self.flow_speed, 0.0..=1.0).text("River Flow"));
                             });
 
@@ -559,12 +602,15 @@ impl ConnectomeAtlasApp {
                                     ui.selectable_value(&mut self.cutaway_mode, SurgicalCutawayMode::SuperiorAxialDome, "Dome");
                                 });
                                 ui.add(egui::Slider::new(&mut self.cutaway_offset_mm, -28.0..=28.0).text("Cutaway Offset"));
+                                ui.checkbox(&mut self.show_internal_organs, "3D Subcortical & Internal Anatomy");
+                                ui.checkbox(&mut self.show_anatomical_labels, "Anatomical Landmark Callouts");
                                 ui.checkbox(&mut self.show_tensor_glyphs, "3D Crossing-Fiber Tensor Glyphs");
-                                ui.checkbox(&mut self.show_slice_planes, "3D Stereotaxic Crosshairs");
+                                ui.checkbox(&mut self.show_slice_planes, "3D Stereotaxic Slice Grid");
                                 if self.show_slice_planes {
-                                    ui.add(egui::Slider::new(&mut self.slice_x_mm, -68.0..=68.0).text("Sagittal X"));
-                                    ui.add(egui::Slider::new(&mut self.slice_y_mm, -95.0..=70.0).text("Coronal Y"));
-                                    ui.add(egui::Slider::new(&mut self.slice_z_mm, -56.0..=70.0).text("Axial Z"));
+                                    let ext = self.anatomy_scene.slice_extent_mm.max(40.0);
+                                    ui.add(egui::Slider::new(&mut self.slice_x_mm, -ext..=ext).text("Sagittal X"));
+                                    ui.add(egui::Slider::new(&mut self.slice_y_mm, -ext..=ext).text("Coronal Y"));
+                                    ui.add(egui::Slider::new(&mut self.slice_z_mm, -ext..=ext).text("Axial Z"));
                                 }
                             });
 
@@ -1061,6 +1107,7 @@ impl ConnectomeAtlasApp {
                 Some(Ok(loaded)) => {
                     self.atlas = loaded;
                     self.selected_region = self.atlas.regions.first().map(|r| r.id.clone());
+                    self.apply_species_framing();
                     self.recompute();
                     self.status_msg = format!("Loaded snapshot '{slot_name}'.");
                 }
@@ -1078,8 +1125,32 @@ impl ConnectomeAtlasApp {
         let rect = response.rect;
         painter.rect_filled(rect, 0.0, Color32::from_rgb(9, 13, 21));
 
+        // Optional chase-camera fly-through along shortest signaling pathway
+        if self.fly_ctrl.active {
+            if let Some(p) = &self.active_path {
+                let mut coord_lookup = HashMap::new();
+                for r in &self.atlas.regions {
+                    coord_lookup.insert(r.id.as_str(), r.coord);
+                }
+                let poly: Vec<[f32; 3]> = p
+                    .hops
+                    .iter()
+                    .filter_map(|h| coord_lookup.get(h.as_str()).copied())
+                    .collect();
+                if let Some((eye, look)) = self.fly_ctrl.sample_pathway_pose(&poly) {
+                    let diff = eye - look;
+                    let dist = diff.length().max(24.0);
+                    self.camera.target = look;
+                    self.camera.distance = dist.clamp(65.0, 420.0);
+                    self.camera.pitch_rad = (diff.z / dist).clamp(-0.98, 0.98).asin();
+                    self.camera.yaw_rad = diff.x.atan2(diff.y);
+                }
+            }
+        }
+
         if response.dragged() {
             let d = response.drag_delta();
+            self.fly_ctrl.active = false;
             self.camera.orbit(glam::Vec2::new(d.x, d.y));
         }
         if response.hovered() {
@@ -1095,76 +1166,227 @@ impl ConnectomeAtlasApp {
                 .map(|([x, y], z)| (Pos2::new(rect.left() + x, rect.top() + y), z))
         };
 
-        // 1. Translucent Glass Brain / Anatomical Reference Wireframe Ellipsoids
-        if self.shell_opacity > 0.01 {
-            let alpha = (self.shell_opacity * 110.0) as u8;
-            let shell_col = Color32::from_rgba_unmultiplied(120, 175, 230, alpha);
-            for lat in [-0.7_f32, -0.35, 0.0, 0.35, 0.7] {
-                let z = lat * 58.0 + 10.0;
-                let scale_xy = (1.0 - lat * lat * 0.75).sqrt();
-                let mut ring = Vec::new();
-                for step in 0..=36 {
-                    let ang = (step as f32 / 36.0) * std::f32::consts::TAU;
-                    let pt = [
-                        ang.cos() * 68.0 * scale_xy,
-                        ang.sin() * 86.0 * scale_xy - 10.0,
-                        z,
-                    ];
-                    if !is_point_clipped_by_cutaway(pt, self.cutaway_mode, self.cutaway_offset_mm) {
-                        if let Some((sp, _)) = to_screen(pt, &self.camera) {
-                            ring.push(sp);
+        let eye = self.camera.eye_position();
+        let light_key = Vec3::new(0.42, 0.58, 0.70).normalize();
+        let light_rim = Vec3::new(-0.55, -0.35, 0.35).normalize();
+
+        struct ShadedTri {
+            depth: f32,
+            p: [Pos2; 3],
+            c: [Color32; 3],
+        }
+
+        let mut shell_back_tris: Vec<ShadedTri> = Vec::new();
+        let mut organ_tris: Vec<ShadedTri> = Vec::new();
+        let mut shell_front_tris: Vec<ShadedTri> = Vec::new();
+        let mut cutaway_edges: Vec<(Pos2, Pos2)> = Vec::new();
+
+        let shade_vertex = |wp: Vec3,
+                            wn: Vec3,
+                            cr: f32,
+                            base_rgb: [u8; 3],
+                            rim_rgb: [u8; 3],
+                            layer: AnatomicalLayer,
+                            op_scale: f32,
+                            is_front: bool|
+         -> Color32 {
+            let n = if is_front { wn } else { -wn }.normalize_or_zero();
+            let v = (eye - wp).normalize_or_zero();
+            let n_dot_l = n.dot(light_key).max(0.0);
+            let n_dot_fill = n.dot(light_rim).max(0.0);
+            let half_vec = (light_key + v).normalize_or_zero();
+            let spec = n.dot(half_vec).max(0.0).powf(24.0);
+            let fresnel = (1.0 - n.dot(v).abs().clamp(0.0, 1.0)).powf(1.85);
+            let ao = (0.72 + 0.28 * cr).clamp(0.42, 1.15);
+
+            match layer {
+                AnatomicalLayer::InternalOrgan => {
+                    let diff = (0.28 + 0.62 * n_dot_l + 0.22 * n_dot_fill) * ao;
+                    let r = (base_rgb[0] as f32 * diff
+                        + rim_rgb[0] as f32 * (fresnel * 0.42 + spec * 0.36))
+                        .clamp(0.0, 255.0) as u8;
+                    let g = (base_rgb[1] as f32 * diff
+                        + rim_rgb[1] as f32 * (fresnel * 0.42 + spec * 0.36))
+                        .clamp(0.0, 255.0) as u8;
+                    let b = (base_rgb[2] as f32 * diff
+                        + rim_rgb[2] as f32 * (fresnel * 0.42 + spec * 0.36))
+                        .clamp(0.0, 255.0) as u8;
+                    let alpha = (232.0 * op_scale).clamp(48.0, 244.0) as u8;
+                    Color32::from_rgba_unmultiplied(r, g, b, alpha)
+                }
+                AnatomicalLayer::OuterShell => {
+                    let diff = (0.34 + 0.56 * n_dot_l + 0.26 * n_dot_fill) * ao;
+                    let rim_boost = fresnel * if is_front { 0.85 } else { 0.42 };
+                    let r = (base_rgb[0] as f32 * diff + rim_rgb[0] as f32 * (rim_boost + spec * 0.32))
+                        .clamp(0.0, 255.0) as u8;
+                    let g = (base_rgb[1] as f32 * diff + rim_rgb[1] as f32 * (rim_boost + spec * 0.32))
+                        .clamp(0.0, 255.0) as u8;
+                    let b = (base_rgb[2] as f32 * diff + rim_rgb[2] as f32 * (rim_boost + spec * 0.32))
+                        .clamp(0.0, 255.0) as u8;
+                    let raw_alpha = if is_front {
+                        self.shell_opacity * op_scale * (0.11 + 1.05 * fresnel) * 235.0
+                    } else {
+                        self.shell_opacity * op_scale * (0.24 + 0.35 * fresnel) * 165.0
+                    };
+                    let alpha = raw_alpha.clamp(8.0, 210.0) as u8;
+                    Color32::from_rgba_unmultiplied(r, g, b, alpha)
+                }
+            }
+        };
+
+        for mesh in &self.anatomy_scene.meshes {
+            let is_shell = mesh.layer == AnatomicalLayer::OuterShell;
+            if is_shell && self.shell_opacity <= 0.01 {
+                continue;
+            }
+            if !is_shell && !self.show_internal_organs {
+                continue;
+            }
+            let n_verts = mesh.vertices.len();
+            let mut proj: Vec<Option<(Pos2, f32)>> = Vec::with_capacity(n_verts);
+            let mut clipped: Vec<bool> = Vec::with_capacity(n_verts);
+            for v in &mesh.vertices {
+                let c = mesh.clippable
+                    && is_point_clipped_by_cutaway(*v, self.cutaway_mode, self.cutaway_offset_mm);
+                clipped.push(c);
+                proj.push(to_screen(*v, &self.camera));
+            }
+
+            for tri in &mesh.triangles {
+                let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+                let c0 = clipped[i0];
+                let c1 = clipped[i1];
+                let c2 = clipped[i2];
+                if c0 || c1 || c2 {
+                    // Collect glowing surgical incision contour along partially clipped triangles
+                    let count_in = (!c0 as u8) + (!c1 as u8) + (!c2 as u8);
+                    if count_in >= 1 && count_in <= 2 {
+                        let pairs = [(i0, i1, c0, c1), (i1, i2, c1, c2), (i2, i0, c2, c0)];
+                        let mut cut_pts: Vec<Pos2> = Vec::with_capacity(2);
+                        for (a, b, ca, cb) in pairs {
+                            if ca != cb {
+                                let mid = Vec3::from_array(mesh.vertices[a])
+                                    .lerp(Vec3::from_array(mesh.vertices[b]), 0.5);
+                                if let Some((sp, _)) = to_screen(mid.to_array(), &self.camera) {
+                                    cut_pts.push(sp);
+                                }
+                            }
+                        }
+                        if cut_pts.len() >= 2 {
+                            cutaway_edges.push((cut_pts[0], cut_pts[1]));
                         }
                     }
+                    continue;
                 }
-                for w in ring.windows(2) {
-                    painter.line_segment([w[0], w[1]], Stroke::new(1.0_f32, shell_col));
+
+                let (Some((p0, d0)), Some((p1, d1)), Some((p2, d2))) =
+                    (proj[i0], proj[i1], proj[i2])
+                else {
+                    continue;
+                };
+
+                let w0 = Vec3::from_array(mesh.vertices[i0]);
+                let w1 = Vec3::from_array(mesh.vertices[i1]);
+                let w2 = Vec3::from_array(mesh.vertices[i2]);
+                let face_n = (w1 - w0).cross(w2 - w0);
+                let face_center = (w0 + w1 + w2) / 3.0;
+                let is_front = face_n.dot(eye - face_center) > 0.0;
+                if !is_shell && !is_front {
+                    continue;
                 }
-            }
-            // Corpus Callosum midline arch + Foliated Cerebellum + Brainstem contours
-            let cc_col = Color32::from_rgba_unmultiplied(253, 230, 138, alpha.saturating_add(35));
-            let cc_pts = [[0.0, 34.0, 4.0], [0.0, 38.0, 14.0], [0.0, 12.0, 24.0], [0.0, -18.0, 25.0], [0.0, -44.0, 18.0]];
-            for w in cc_pts.windows(2) {
-                if let (Some((a, _)), Some((b, _))) = (to_screen(w[0], &self.camera), to_screen(w[1], &self.camera)) {
-                    painter.line_segment([a, b], Stroke::new(2.0_f32, cc_col));
-                }
-            }
-            let cb_col = Color32::from_rgba_unmultiplied(167, 139, 250, alpha.saturating_add(25));
-            for hemi in [-22.0_f32, 22.0] {
-                let mut cb_ring = Vec::new();
-                for step in 0..=24 {
-                    let ang = (step as f32 / 24.0) * std::f32::consts::TAU;
-                    let pt = [hemi + ang.cos() * 22.0, -56.0 + ang.sin() * 18.0, -32.0];
-                    if let Some((sp, _)) = to_screen(pt, &self.camera) {
-                        cb_ring.push(sp);
+
+                let tri_item = ShadedTri {
+                    depth: (d0 + d1 + d2) / 3.0,
+                    p: [p0, p1, p2],
+                    c: [
+                        shade_vertex(
+                            w0,
+                            Vec3::from_array(mesh.normals[i0]),
+                            mesh.crease[i0],
+                            mesh.base_rgb,
+                            mesh.rim_rgb,
+                            mesh.layer,
+                            mesh.opacity_scale,
+                            is_front,
+                        ),
+                        shade_vertex(
+                            w1,
+                            Vec3::from_array(mesh.normals[i1]),
+                            mesh.crease[i1],
+                            mesh.base_rgb,
+                            mesh.rim_rgb,
+                            mesh.layer,
+                            mesh.opacity_scale,
+                            is_front,
+                        ),
+                        shade_vertex(
+                            w2,
+                            Vec3::from_array(mesh.normals[i2]),
+                            mesh.crease[i2],
+                            mesh.base_rgb,
+                            mesh.rim_rgb,
+                            mesh.layer,
+                            mesh.opacity_scale,
+                            is_front,
+                        ),
+                    ],
+                };
+                if is_shell {
+                    if is_front {
+                        shell_front_tris.push(tri_item);
+                    } else {
+                        shell_back_tris.push(tri_item);
                     }
-                }
-                for w in cb_ring.windows(2) {
-                    painter.line_segment([w[0], w[1]], Stroke::new(1.2_f32, cb_col));
-                }
-            }
-            let bs_pts = [[0.0, -16.0, -6.0], [0.0, -24.0, -22.0], [0.0, -30.0, -38.0], [0.0, -34.0, -54.0]];
-            let bs_col = Color32::from_rgba_unmultiplied(148, 163, 184, alpha.saturating_add(35));
-            for w in bs_pts.windows(2) {
-                if let (Some((a, _)), Some((b, _))) = (to_screen(w[0], &self.camera), to_screen(w[1], &self.camera)) {
-                    painter.line_segment([a, b], Stroke::new(2.4_f32, bs_col));
+                } else {
+                    organ_tris.push(tri_item);
                 }
             }
         }
 
-        // 2. Optional Axial Stereotaxic Slicing Grid (Z = slice_z_mm)
+        let flush_tris = |tris: &mut Vec<ShadedTri>| {
+            tris.sort_by(|a, b| b.depth.total_cmp(&a.depth));
+            let mut emesh = EguiMesh::default();
+            emesh.vertices.reserve(tris.len() * 3);
+            emesh.indices.reserve(tris.len() * 3);
+            for t in tris.iter() {
+                let base = emesh.vertices.len() as u32;
+                for k in 0..3 {
+                    emesh.vertices.push(EguiVertex {
+                        pos: t.p[k],
+                        uv: WHITE_UV,
+                        color: t.c[k],
+                    });
+                    emesh.indices.push(base + k as u32);
+                }
+            }
+            if !emesh.indices.is_empty() {
+                painter.add(egui::Shape::mesh(emesh));
+            }
+        };
+
+        // Pass 1: Back-facing translucent outer cortical / body shell
+        flush_tris(&mut shell_back_tris);
+
+        // Pass 2: Shaded 3D internal anatomical organs (cerebellum, brainstem, callosum, pharynx, central complex)
+        flush_tris(&mut organ_tris);
+
+        // Pass 3: Optional Axial Stereotaxic Slicing Grid scaled to active species
         if self.show_slice_planes {
-            let grid_col = Color32::from_rgba_unmultiplied(56, 189, 248, 36);
-            for g in (-60..=60).step_by(20) {
+            let ext = self.anatomy_scene.slice_extent_mm;
+            let step = if ext > 80.0 { 25 } else { 20 };
+            let ext_i = ((ext / step as f32).floor() as i32) * step;
+            let grid_col = Color32::from_rgba_unmultiplied(56, 189, 248, 30);
+            for g in (-ext_i..=ext_i).step_by(step as usize) {
                 let gf = g as f32;
                 if let (Some((a, _)), Some((b, _))) = (
-                    to_screen([-70.0, gf - 10.0, self.slice_z_mm], &self.camera),
-                    to_screen([70.0, gf - 10.0, self.slice_z_mm], &self.camera),
+                    to_screen([-ext, gf, self.slice_z_mm], &self.camera),
+                    to_screen([ext, gf, self.slice_z_mm], &self.camera),
                 ) {
                     painter.line_segment([a, b], Stroke::new(1.0_f32, grid_col));
                 }
                 if let (Some((a, _)), Some((b, _))) = (
-                    to_screen([gf, -95.0, self.slice_z_mm], &self.camera),
-                    to_screen([gf, 75.0, self.slice_z_mm], &self.camera),
+                    to_screen([gf, -ext, self.slice_z_mm], &self.camera),
+                    to_screen([gf, ext, self.slice_z_mm], &self.camera),
                 ) {
                     painter.line_segment([a, b], Stroke::new(1.0_f32, grid_col));
                 }
@@ -1182,7 +1404,6 @@ impl ConnectomeAtlasApp {
             betw_map.insert(nm.region_id.as_str(), nm.betweenness_centrality);
         }
 
-        // Highlighted hops set if ShortestPath is active
         let mut path_pairs = Vec::new();
         if let Some(p) = &self.active_path {
             for w in p.hops.windows(2) {
@@ -1190,7 +1411,7 @@ impl ConnectomeAtlasApp {
             }
         }
 
-        // 3. Curved 3D White-Matter / Synaptic Streamlines with Calm Tonic Laminar Flow
+        // Pass 4: Curved 3D White-Matter / Synaptic Streamlines with Calm Tonic Laminar Flow
         for edge in &self.atlas.edges {
             if !self.atlas.is_edge_intact(edge, self.min_weight) {
                 continue;
@@ -1229,42 +1450,82 @@ impl ConnectomeAtlasApp {
             for (strand_i, curve) in strands.iter().enumerate() {
                 let n_seg = curve.len().saturating_sub(1);
                 for s_idx in 0..n_seg {
-                let (Some((p0, _)), Some((p1, _))) = (
-                    to_screen(curve[s_idx], &self.camera),
-                    to_screen(curve[s_idx + 1], &self.camera),
-                ) else {
-                    continue;
-                };
-                let u_frac = (s_idx as f32) / (n_seg.max(1) as f32);
-                // Smooth sinusoidal laminar wave (calm, never flashing)
-                let wave = 0.78 + 0.22 * ((u_frac - self.tonic_phase) * std::f32::consts::TAU).sin();
-                let (col, width) = if on_shortest_path {
-                    (
-                        Color32::from_rgba_unmultiplied(
-                            253,
-                            (224.0 * wave) as u8,
-                            71,
-                            235,
-                        ),
-                        3.4,
-                    )
-                } else {
-                    let alpha = ((edge.weight as f32 * 135.0 + 35.0) * wave).clamp(28.0, 190.0) as u8;
-                    (
-                        Color32::from_rgba_unmultiplied(base_rgb[0], base_rgb[1], base_rgb[2], alpha),
-                        if strand_i == 0 {
-                            1.1 + (edge.weight as f32) * 1.1
-                        } else {
-                            0.65 + (edge.weight as f32) * 0.55
-                        },
-                    )
-                };
-                painter.line_segment([p0, p1], Stroke::new(width, col));
+                    let (Some((p0, _)), Some((p1, _))) = (
+                        to_screen(curve[s_idx], &self.camera),
+                        to_screen(curve[s_idx + 1], &self.camera),
+                    ) else {
+                        continue;
+                    };
+                    let u_frac = (s_idx as f32) / (n_seg.max(1) as f32);
+                    let wave =
+                        0.78 + 0.22 * ((u_frac - self.tonic_phase) * std::f32::consts::TAU).sin();
+                    let (col, width) = if on_shortest_path {
+                        (
+                            Color32::from_rgba_unmultiplied(
+                                253,
+                                (224.0 * wave) as u8,
+                                71,
+                                242,
+                            ),
+                            3.6,
+                        )
+                    } else {
+                        let alpha =
+                            ((edge.weight as f32 * 145.0 + 42.0) * wave).clamp(32.0, 210.0) as u8;
+                        (
+                            Color32::from_rgba_unmultiplied(
+                                base_rgb[0],
+                                base_rgb[1],
+                                base_rgb[2],
+                                alpha,
+                            ),
+                            if strand_i == 0 {
+                                1.25 + (edge.weight as f32) * 1.1
+                            } else {
+                                0.70 + (edge.weight as f32) * 0.55
+                            },
+                        )
+                    };
+                    painter.line_segment([p0, p1], Stroke::new(width, col));
                 }
             }
         }
 
-        // 4. Depth-Sorted 3D Anatomical Region Parcels / Somas
+        // Pass 5: 3D Crossing-Fiber Diffusion Tensor Glyphs
+        if self.show_tensor_glyphs {
+            for r in &self.atlas.regions {
+                if self.atlas.ablated_regions.contains(&r.id) {
+                    continue;
+                }
+                if let Some(ft) = self.fiber_tensors.iter().find(|t| t.region_id == r.id) {
+                    if ft.fractional_anisotropy < 0.14 {
+                        continue;
+                    }
+                    let u = Vec3::from_array(ft.principal_axis).normalize_or_zero();
+                    let span = (r.radius_mm * (1.2 + 0.9 * ft.fractional_anisotropy as f32)).min(8.5);
+                    let a = Vec3::from_array(r.coord) - u * span;
+                    let b = Vec3::from_array(r.coord) + u * span;
+                    if let (Some((pa, _)), Some((pb, _))) =
+                        (to_screen(a.to_array(), &self.camera), to_screen(b.to_array(), &self.camera))
+                    {
+                        let rgb = [
+                            (u.x.abs() * 230.0 + 25.0) as u8,
+                            (u.y.abs() * 230.0 + 25.0) as u8,
+                            (u.z.abs() * 230.0 + 25.0) as u8,
+                        ];
+                        painter.line_segment(
+                            [pa, pb],
+                            Stroke::new(
+                                1.6_f32,
+                                Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], 145),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Pass 6: Depth-Sorted 3D Anatomical Region Parcels / Somas
         let mut projected_nodes = Vec::new();
         for r in &self.atlas.regions {
             if let Some((sp, depth)) = to_screen(r.coord, &self.camera) {
@@ -1283,7 +1544,7 @@ impl ConnectomeAtlasApp {
         for (r, sp, _depth) in projected_nodes {
             let ablated = self.atlas.ablated_regions.contains(&r.id);
             let is_selected = self.selected_region.as_deref() == Some(r.id.as_str());
-            let radius_px = (r.radius_mm * 240.0 / self.camera.distance).clamp(4.5, 15.0);
+            let radius_px = (r.radius_mm * 235.0 / self.camera.distance).clamp(4.2, 13.5);
 
             if let Some(cp) = click_pos {
                 if cp.distance(sp) <= radius_px + 5.0 {
@@ -1298,27 +1559,101 @@ impl ConnectomeAtlasApp {
                     ColorSchemeMode::BetweennessHeatmap => {
                         let b = betw_map.get(r.id.as_str()).copied().unwrap_or(0.0) as f32;
                         let t = (b * 4.5).clamp(0.0, 1.0);
-                        [(50.0 + 205.0 * t) as u8, (190.0 - 95.0 * t) as u8, (245.0 - 190.0 * t) as u8]
+                        [
+                            (50.0 + 205.0 * t) as u8,
+                            (190.0 - 95.0 * t) as u8,
+                            (245.0 - 190.0 * t) as u8,
+                        ]
                     }
                     _ => parse_hex_color(&r.color_hex),
                 }
             };
 
+            painter.circle_filled(sp, radius_px + 1.2, Color32::from_rgba_unmultiplied(6, 10, 18, 210));
             painter.circle_filled(sp, radius_px, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+            // Specular sphere highlight
+            painter.circle_filled(
+                Pos2::new(sp.x - radius_px * 0.28, sp.y - radius_px * 0.28),
+                (radius_px * 0.30).max(1.2),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 145),
+            );
             if ablated {
-                painter.circle_stroke(sp, radius_px + 2.5, Stroke::new(1.8_f32, Color32::from_rgb(239, 68, 68)));
+                painter.circle_stroke(
+                    sp,
+                    radius_px + 2.5,
+                    Stroke::new(1.8_f32, Color32::from_rgb(239, 68, 68)),
+                );
             } else if is_selected {
                 painter.circle_stroke(sp, radius_px + 3.0, Stroke::new(2.2_f32, Color32::WHITE));
             }
 
-            if is_selected || radius_px >= 6.2 {
+            if is_selected || radius_px >= 6.4 {
+                painter.text(
+                    Pos2::new(sp.x + 1.0, sp.y - radius_px - 2.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    &r.id,
+                    FontId::proportional(10.5),
+                    Color32::from_rgba_unmultiplied(8, 12, 20, 220),
+                );
                 painter.text(
                     Pos2::new(sp.x, sp.y - radius_px - 3.0),
                     egui::Align2::CENTER_BOTTOM,
                     &r.id,
-                    FontId::proportional(11.0),
-                    Color32::from_rgba_unmultiplied(226, 232, 240, 215),
+                    FontId::proportional(10.5),
+                    Color32::from_rgba_unmultiplied(241, 245, 249, 235),
                 );
+            }
+        }
+
+        // Pass 7: Front-Facing Fresnel Rim-Lit Cortical / Organism Outer Glass Pass + Cutaway Edge Glow
+        flush_tris(&mut shell_front_tris);
+        if self.shell_opacity > 0.01 && !cutaway_edges.is_empty() {
+            let cut_col = Color32::from_rgba_unmultiplied(103, 232, 249, 175);
+            for (pa, pb) in cutaway_edges {
+                painter.line_segment([pa, pb], Stroke::new(1.6_f32, cut_col));
+            }
+        }
+
+        // Pass 8: Species Anatomical Landmark Callouts (inward-aligned so edges never clip)
+        if self.show_anatomical_labels {
+            let mid_x = rect.center().x;
+            for lm in &self.anatomy_scene.landmarks {
+                if let Some((sp, _)) = to_screen(lm.coord, &self.camera) {
+                    if !rect.contains(sp) {
+                        continue;
+                    }
+                    let on_right = sp.x > mid_x + 35.0;
+                    let tick_dx = if on_right { -10.0 } else { 10.0 };
+                    let tick_dy = if sp.y < rect.top() + 36.0 { 10.0 } else { -10.0 };
+                    let tick_end = Pos2::new(
+                        (sp.x + tick_dx).clamp(rect.left() + 6.0, rect.right() - 6.0),
+                        (sp.y + tick_dy).clamp(rect.top() + 10.0, rect.bottom() - 10.0),
+                    );
+                    let align = if on_right {
+                        egui::Align2::RIGHT_CENTER
+                    } else {
+                        egui::Align2::LEFT_CENTER
+                    };
+                    let text_dx = if on_right { -3.0 } else { 3.0 };
+                    let tick_col =
+                        Color32::from_rgba_unmultiplied(lm.color[0], lm.color[1], lm.color[2], 160);
+                    painter.circle_filled(sp, 2.2, tick_col);
+                    painter.line_segment([sp, tick_end], Stroke::new(1.0_f32, tick_col));
+                    painter.text(
+                        Pos2::new(tick_end.x + text_dx + 1.0, tick_end.y + 1.0),
+                        align,
+                        lm.label,
+                        FontId::proportional(10.5),
+                        Color32::from_rgba_unmultiplied(6, 10, 18, 225),
+                    );
+                    painter.text(
+                        Pos2::new(tick_end.x + text_dx, tick_end.y),
+                        align,
+                        lm.label,
+                        FontId::proportional(10.5),
+                        Color32::from_rgba_unmultiplied(lm.color[0], lm.color[1], lm.color[2], 225),
+                    );
+                }
             }
         }
 
@@ -1361,13 +1696,14 @@ impl ConnectomeAtlasApp {
 
 impl ConnectomeAtlasApp {
     fn draw_triplanar_2d_strip(&mut self, ui: &mut egui::Ui) {
+        let ext = self.anatomy_scene.slice_extent_mm.max(40.0);
         ui.columns(3, |cols| {
             let planes = [
-                ("AXIAL (XY)", 0_u8, self.slice_z_mm),
-                ("CORONAL (XZ)", 1_u8, self.slice_y_mm),
-                ("SAGITTAL (YZ)", 2_u8, self.slice_x_mm),
+                ("AXIAL (XY)", 0_u8, self.slice_z_mm, ["L", "R", "A", "P"]),
+                ("CORONAL (XZ)", 1_u8, self.slice_y_mm, ["L", "R", "S", "I"]),
+                ("SAGITTAL (YZ)", 2_u8, self.slice_x_mm, ["P", "A", "S", "I"]),
             ];
-            for (idx, (title, mode, slice_v)) in planes.into_iter().enumerate() {
+            for (idx, (title, mode, slice_v, dirs)) in planes.into_iter().enumerate() {
                 let col_ui = &mut cols[idx];
                 col_ui.label(egui::RichText::new(format!("{title} @ {slice_v:.0} mm")).small().strong());
                 let avail = col_ui.available_size();
@@ -1376,30 +1712,93 @@ impl ConnectomeAtlasApp {
                 painter.rect_filled(r, 4.0, Color32::from_rgb(6, 9, 17));
                 let cx = r.center().x;
                 let cy = r.center().y;
-                let scale = (r.width().min(r.height()) / 195.0).max(0.4);
+                let scale = (r.height() / (ext * 2.15))
+                    .min(r.width() / (ext * 2.35))
+                    .max(0.45);
 
                 if resp.clicked() || resp.dragged() {
                     if let Some(ptr) = resp.interact_pointer_pos() {
-                        let u_mm = ((ptr.x - cx) / scale).clamp(-70.0, 70.0);
-                        let v_mm = ((cy - ptr.y) / scale).clamp(-90.0, 70.0);
+                        let u_mm = ((ptr.x - cx) / scale).clamp(-ext, ext);
+                        let v_mm = ((cy - ptr.y) / scale).clamp(-ext, ext);
                         match mode {
                             0 => { self.slice_x_mm = u_mm; self.slice_y_mm = v_mm; }
-                            1 => { self.slice_x_mm = u_mm; self.slice_z_mm = v_mm.clamp(-56.0, 70.0); }
-                            _ => { self.slice_y_mm = u_mm; self.slice_z_mm = v_mm.clamp(-56.0, 70.0); }
+                            1 => { self.slice_x_mm = u_mm; self.slice_z_mm = v_mm; }
+                            _ => { self.slice_y_mm = u_mm; self.slice_z_mm = v_mm; }
                         }
                     }
                 }
 
+                // Species-accurate anatomical cross-section contours
+                let contours = generate_2d_slice_contours(&self.atlas.id, mode, slice_v);
+                for contour in contours {
+                    let screen_pts: Vec<Pos2> = contour
+                        .points
+                        .iter()
+                        .map(|&[u, v]| Pos2::new(cx + u * scale, cy - v * scale))
+                        .collect();
+                    if contour.closed && screen_pts.len() >= 3 {
+                        if contour.fill_rgba[3] > 0 {
+                            let fill_col = Color32::from_rgba_unmultiplied(
+                                contour.fill_rgba[0],
+                                contour.fill_rgba[1],
+                                contour.fill_rgba[2],
+                                contour.fill_rgba[3],
+                            );
+                            let mut c_sum = Vec2::ZERO;
+                            for &sp in &screen_pts {
+                                c_sum += sp.to_vec2();
+                            }
+                            let centroid = (c_sum / (screen_pts.len() as f32)).to_pos2();
+                            let mut em = EguiMesh::default();
+                            em.vertices.push(EguiVertex { pos: centroid, uv: WHITE_UV, color: fill_col });
+                            for &sp in &screen_pts {
+                                em.vertices.push(EguiVertex { pos: sp, uv: WHITE_UV, color: fill_col });
+                            }
+                            let m = screen_pts.len() as u32;
+                            for i in 0..m {
+                                em.indices.push(0);
+                                em.indices.push(1 + i);
+                                em.indices.push(1 + (i + 1) % m);
+                            }
+                            painter.add(egui::Shape::mesh(em));
+                        }
+                        if contour.stroke_rgba[3] > 0 {
+                            let stroke_col = Color32::from_rgba_unmultiplied(
+                                contour.stroke_rgba[0],
+                                contour.stroke_rgba[1],
+                                contour.stroke_rgba[2],
+                                contour.stroke_rgba[3],
+                            );
+                            painter.add(egui::Shape::closed_line(
+                                screen_pts,
+                                Stroke::new(contour.stroke_width, stroke_col),
+                            ));
+                        }
+                    } else if screen_pts.len() >= 2 && contour.stroke_rgba[3] > 0 {
+                        let stroke_col = Color32::from_rgba_unmultiplied(
+                            contour.stroke_rgba[0],
+                            contour.stroke_rgba[1],
+                            contour.stroke_rgba[2],
+                            contour.stroke_rgba[3],
+                        );
+                        painter.add(egui::Shape::line(
+                            screen_pts,
+                            Stroke::new(contour.stroke_width, stroke_col),
+                        ));
+                    }
+                }
+
+                let slab_half = if ext > 80.0 { 28.0 } else { 24.0 };
                 for reg in &self.atlas.regions {
                     let (u, v, ortho) = match mode {
                         0 => (reg.coord[0], reg.coord[1], reg.coord[2]),
                         1 => (reg.coord[0], reg.coord[2], reg.coord[1]),
                         _ => (reg.coord[1], reg.coord[2], reg.coord[0]),
                     };
-                    if (ortho - slice_v).abs() <= 24.0 {
+                    if (ortho - slice_v).abs() <= slab_half {
                         let rgb = parse_hex_color(&reg.color_hex);
                         let pos = Pos2::new(cx + u * scale, cy - v * scale);
-                        painter.circle_filled(pos, 3.2, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                        painter.circle_filled(pos, 3.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
                     }
                 }
 
@@ -1410,9 +1809,16 @@ impl ConnectomeAtlasApp {
                 };
                 let ch_x = (cx + ch_u * scale).clamp(r.left(), r.right());
                 let ch_y = (cy - ch_v * scale).clamp(r.top(), r.bottom());
-                let line_col = Color32::from_rgba_unmultiplied(56, 189, 248, 130);
+                let line_col = Color32::from_rgba_unmultiplied(56, 189, 248, 120);
                 painter.line_segment([Pos2::new(ch_x, r.top()), Pos2::new(ch_x, r.bottom())], Stroke::new(1.0_f32, line_col));
                 painter.line_segment([Pos2::new(r.left(), ch_y), Pos2::new(r.right(), ch_y)], Stroke::new(1.0_f32, line_col));
+
+                // Radiological axis orientation letters
+                let dir_col = Color32::from_rgba_unmultiplied(148, 163, 184, 175);
+                painter.text(Pos2::new(r.left() + 6.0, cy), egui::Align2::LEFT_CENTER, dirs[0], FontId::proportional(9.5), dir_col);
+                painter.text(Pos2::new(r.right() - 6.0, cy), egui::Align2::RIGHT_CENTER, dirs[1], FontId::proportional(9.5), dir_col);
+                painter.text(Pos2::new(cx, r.top() + 4.0), egui::Align2::CENTER_TOP, dirs[2], FontId::proportional(9.5), dir_col);
+                painter.text(Pos2::new(cx, r.bottom() - 4.0), egui::Align2::CENTER_BOTTOM, dirs[3], FontId::proportional(9.5), dir_col);
             }
         });
     }
@@ -1549,6 +1955,13 @@ pub fn render_headless_screenshot(
             a.right_tab = RightTab::RichClubHubs;
             a.color_mode = ColorSchemeMode::BetweennessHeatmap;
             a.cutaway_mode = SurgicalCutawayMode::Intact;
+            a
+        }
+        4 => {
+            let mut a = ConnectomeAtlasApp::new_headless(1);
+            a.right_tab = RightTab::Inspector;
+            a.color_mode = ColorSchemeMode::FunctionalNetwork;
+            a.cutaway_mode = SurgicalCutawayMode::AnteriorSuperiorOctant;
             a
         }
         _ => {

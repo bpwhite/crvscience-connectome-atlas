@@ -9,9 +9,9 @@
     "atlas_core": 7,
     "atlas_gui": 1,
     "atlas_io": 2,
-    "atlas_render": 1,
-    "total": 11,
-    "passed": 11,
+    "atlas_render": 2,
+    "total": 12,
+    "passed": 12,
     "failed": 0
   },
   "headless_screenshots": [
@@ -21,7 +21,7 @@
       "file": "validation/headless_screenshot.png",
       "width": 1600,
       "height": 1000,
-      "bytes": 509082
+      "bytes": 720314
     },
     {
       "view": 2,
@@ -29,7 +29,7 @@
       "file": "validation/headless_screenshot_2.png",
       "width": 1600,
       "height": 1000,
-      "bytes": 271703
+      "bytes": 397657
     },
     {
       "view": 3,
@@ -37,7 +37,7 @@
       "file": "validation/headless_screenshot_3.png",
       "width": 1600,
       "height": 1000,
-      "bytes": 287912
+      "bytes": 403864
     }
   ]
 }

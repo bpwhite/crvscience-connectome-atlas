@@ -1,0 +1,43 @@
+{
+  "app": "ConnectomeAtlas",
+  "version": "0.8.0",
+  "license": "GPL-3.0-or-later",
+  "repository": "https://github.com/bpwhite/crvscience-connectome-atlas",
+  "binary": "20_Connectome-Atlas.exe",
+  "presets_count": 4,
+  "cargo_tests": {
+    "atlas_core": 7,
+    "atlas_gui": 1,
+    "atlas_io": 2,
+    "atlas_render": 1,
+    "total": 11,
+    "passed": 11,
+    "failed": 0
+  },
+  "headless_screenshots": [
+    {
+      "view": 1,
+      "preset": "human_mni152",
+      "file": "validation/headless_screenshot.png",
+      "width": 1600,
+      "height": 1000,
+      "bytes": 509082
+    },
+    {
+      "view": 2,
+      "preset": "drosophila_flywire",
+      "file": "validation/headless_screenshot_2.png",
+      "width": 1600,
+      "height": 1000,
+      "bytes": 271703
+    },
+    {
+      "view": 3,
+      "preset": "celegans_wormatlas",
+      "file": "validation/headless_screenshot_3.png",
+      "width": 1600,
+      "height": 1000,
+      "bytes": 287912
+    }
+  ]
+}

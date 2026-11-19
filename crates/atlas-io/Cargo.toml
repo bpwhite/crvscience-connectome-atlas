@@ -1,0 +1,13 @@
+[package]
+name = "atlas-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+atlas-core = { path = "../atlas-core" }
+flate2.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "atlas-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+atlas-core = { path = "../atlas-core" }
+glam.workspace = true
+serde.workspace = true
+wgpu.workspace = true

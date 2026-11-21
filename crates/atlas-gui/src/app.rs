@@ -398,6 +398,29 @@ impl ConnectomeAtlasApp {
         }
     }
 
+    pub fn select_region(&mut self, rid: String, sync_slices: bool) {
+        if sync_slices {
+            if let Some(reg) = self.atlas.regions.iter().find(|r| r.id == rid) {
+                self.slice_x_mm = reg.coord[0];
+                self.slice_y_mm = reg.coord[1];
+                self.slice_z_mm = reg.coord[2];
+            }
+        }
+        self.selected_region = Some(rid);
+        self.domain_decode = self
+            .atlas
+            .decode_functional_domains(self.selected_region.as_deref(), self.min_weight);
+    }
+
+    fn open_dataset_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Connectome & Neuroimaging", &["json", "swc", "trk", "nii", "gz"])
+            .pick_file()
+        {
+            self.load_file_from_path(&path);
+        }
+    }
+
     fn export_envelope_dialog(&mut self) {
         let default_name = format!("{}.connectome.json", self.atlas.id);
         let Some(path) = rfd::FileDialog::new()
@@ -460,10 +483,33 @@ impl ConnectomeAtlasApp {
             ctx.request_repaint();
         }
 
-        // Global Keyboard Shortcuts (Ctrl/Cmd+K Command Palette & Z Zen Full-Canvas)
+        // Global Keyboard Shortcuts (Escape, F1, Ctrl/Cmd+K/O/S, Z Zen Full-Canvas)
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.cmd_palette_open {
+                self.cmd_palette_open = false;
+            } else if self.show_about_window {
+                self.show_about_window = false;
+            } else if self.fly_ctrl.active {
+                self.fly_ctrl.active = false;
+            } else if self.zen_mode {
+                self.zen_mode = false;
+                self.show_left_panel = true;
+                self.show_right_panel = true;
+                self.show_bottom_slices = true;
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+            self.show_about_window = !self.show_about_window;
+        }
         if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::K)) {
             self.cmd_palette_open = !self.cmd_palette_open;
             self.cmd_query.clear();
+        }
+        if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::O)) {
+            self.open_dataset_dialog();
+        }
+        if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::S)) {
+            self.export_envelope_dialog();
         }
         if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Z)) {
             self.zen_mode = !self.zen_mode;
@@ -617,6 +663,26 @@ impl ConnectomeAtlasApp {
                         egui::CollapsingHeader::new("3. Receptors, Control & Harmonics")
                             .default_open(false)
                             .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    for (code, label) in [
+                                        ("ht", "5-HT"),
+                                        ("da", "DA"),
+                                        ("ach", "ACh"),
+                                        ("glu", "Glu"),
+                                        ("gaba", "GABA"),
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.receptor_channel,
+                                                code.to_string(),
+                                                label,
+                                            )
+                                            .changed()
+                                        {
+                                            self.recompute();
+                                        }
+                                    }
+                                });
                                 if ui.add(egui::Slider::new(&mut self.agonist_gain, -0.8..=2.0).text("Receptor Gain alpha")).changed() {
                                     self.recompute();
                                 }
@@ -714,12 +780,7 @@ impl ConnectomeAtlasApp {
                 self.cmd_palette_open = false;
                 match act {
                     CommandAction::JumpToRegion(rid) => {
-                        if let Some(r) = self.atlas.regions.iter().find(|r| r.id == rid) {
-                            self.slice_x_mm = r.coord[0];
-                            self.slice_y_mm = r.coord[1];
-                            self.slice_z_mm = r.coord[2];
-                        }
-                        self.selected_region = Some(rid.clone());
+                        self.select_region(rid.clone(), true);
                         self.status_msg = format!("Jumped to {rid}.");
                     }
                     CommandAction::SwitchPreset(pid) => {
@@ -835,6 +896,7 @@ impl ConnectomeAtlasApp {
             ui.add_space(6.0);
         }
 
+        let mut next_region: Option<String> = None;
         if let Some(sel_id) = &self.selected_region.clone() {
             if let Some(reg) = self.atlas.regions.iter().find(|r| &r.id == sel_id) {
                 ui.heading(format!("{} - {}", reg.id, reg.name));
@@ -852,20 +914,20 @@ impl ConnectomeAtlasApp {
                 ui.label(egui::RichText::new(format!("<- Afferent Inputs ({})", inc.len())).strong().color(Color32::from_rgb(52, 211, 153)));
                 for e in inc {
                     if ui.link(format!("<- {} (w={:.2}, {})", e.source, e.weight, e.tract_name)).clicked() {
-                        self.selected_region = Some(e.source.clone());
+                        next_region = Some(e.source.clone());
                     }
                 }
                 ui.label(egui::RichText::new(format!("-> Efferent Outputs ({})", out.len())).strong().color(Color32::from_rgb(251, 146, 60)));
                 for e in out {
                     if ui.link(format!("-> {} (w={:.2}, {})", e.target, e.weight, e.tract_name)).clicked() {
-                        self.selected_region = Some(e.target.clone());
+                        next_region = Some(e.target.clone());
                     }
                 }
                 ui.label(egui::RichText::new(format!("<-> Reciprocal / Coupled ({})", coup.len())).strong().color(Color32::from_rgb(56, 189, 248)));
                 for e in coup {
                     let peer = if &e.source == sel_id { &e.target } else { &e.source };
                     if ui.link(format!("<-> {} (w={:.2}, {})", peer, e.weight, e.tract_name)).clicked() {
-                        self.selected_region = Some(peer.clone());
+                        next_region = Some(peer.clone());
                     }
                 }
 
@@ -948,6 +1010,9 @@ impl ConnectomeAtlasApp {
                 }
             }
         }
+        if let Some(rid) = next_region {
+            self.select_region(rid, true);
+        }
     }
 
     fn ui_matrix(&mut self, ui: &mut egui::Ui) {
@@ -972,11 +1037,13 @@ impl ConnectomeAtlasApp {
         for (i, r) in self.atlas.regions.iter().enumerate() {
             idx_map.insert(r.id.as_str(), i);
         }
+        let mut weights = vec![vec![0.0_f64; n]; n];
         for e in &self.atlas.edges {
             if !self.atlas.is_edge_intact(e, self.min_weight) {
                 continue;
             }
             if let (Some(&i), Some(&j)) = (idx_map.get(e.source.as_str()), idx_map.get(e.target.as_str())) {
+                weights[i][j] = weights[i][j].max(e.weight);
                 let intensity = (e.weight.clamp(0.0, 1.0) * 235.0) as u8;
                 let col = Color32::from_rgb(30, intensity, 255);
                 let r1 = Rect::from_min_size(
@@ -985,6 +1052,7 @@ impl ConnectomeAtlasApp {
                 );
                 painter.rect_filled(r1, 0.0, col);
                 if !e.directed {
+                    weights[j][i] = weights[j][i].max(e.weight);
                     let r2 = Rect::from_min_size(
                         Pos2::new(rect.left() + (i as f32) * cell, rect.top() + (j as f32) * cell),
                         Vec2::splat((cell - 0.5).max(1.5)),
@@ -992,6 +1060,48 @@ impl ConnectomeAtlasApp {
                     painter.rect_filled(r2, 0.0, col);
                 }
             }
+        }
+        let cell_at = |pos: Pos2| -> Option<(usize, usize)> {
+            if !rect.contains(pos) {
+                return None;
+            }
+            let col = (((pos.x - rect.left()) / cell).floor() as isize).clamp(0, n as isize - 1) as usize;
+            let row = (((pos.y - rect.top()) / cell).floor() as isize).clamp(0, n as isize - 1) as usize;
+            Some((row, col))
+        };
+        let mut clicked_rid: Option<String> = None;
+        if resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                if let Some((row, _col)) = cell_at(pos) {
+                    clicked_rid = Some(self.atlas.regions[row].id.clone());
+                }
+            }
+        }
+        if let Some(pos) = resp.hover_pos() {
+            if let Some((row, col)) = cell_at(pos) {
+                let hover_rect = Rect::from_min_size(
+                    Pos2::new(rect.left() + (col as f32) * cell, rect.top() + (row as f32) * cell),
+                    Vec2::splat(cell.max(2.0)),
+                );
+                painter.rect_stroke(
+                    hover_rect,
+                    0.0,
+                    Stroke::new(1.0_f32, Color32::WHITE),
+                    egui::StrokeKind::Inside,
+                );
+                let src_reg = &self.atlas.regions[row];
+                let dst_reg = &self.atlas.regions[col];
+                let tip = if row == col {
+                    format!("{} — {}", src_reg.id, src_reg.name)
+                } else {
+                    format!("{} -> {} | w={:.2}", src_reg.id, dst_reg.id, weights[row][col])
+                };
+                resp.on_hover_text(tip);
+            }
+        }
+        if let Some(rid) = clicked_rid {
+            self.select_region(rid.clone(), true);
+            self.status_msg = format!("Selected region {rid} from matrix.");
         }
     }
 
@@ -1019,7 +1129,7 @@ impl ConnectomeAtlasApp {
             ui.end_row();
             for item in sorted {
                 if ui.link(&item.region_id).clicked() {
-                    self.selected_region = Some(item.region_id.clone());
+                    self.select_region(item.region_id.clone(), true);
                 }
                 ui.label(format!("{}", item.degree_total));
                 ui.label(format!("{:.2}", item.strength_total));
@@ -1068,12 +1178,7 @@ impl ConnectomeAtlasApp {
                 }
             }
             if ui.button("Open File (.json/.swc/.trk/.nii)...").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Connectome & Neuroimaging", &["json", "swc", "trk", "nii", "gz"])
-                    .pick_file()
-                {
-                    self.load_file_from_path(&path);
-                }
+                self.open_dataset_dialog();
             }
             if ui.button("Export Selected .SWC 3D Arbor...").clicked() {
                 self.export_swc_dialog();
@@ -1658,12 +1763,7 @@ impl ConnectomeAtlasApp {
         }
 
         if let Some(cid) = clicked_region {
-            if let Some(r) = self.atlas.regions.iter().find(|r| r.id == cid) {
-                self.slice_x_mm = r.coord[0];
-                self.slice_y_mm = r.coord[1];
-                self.slice_z_mm = r.coord[2];
-            }
-            self.selected_region = Some(cid.clone());
+            self.select_region(cid.clone(), true);
             match self.probe_mode {
                 ProbeMode::Inspect => {
                     self.status_msg = format!("Inspecting region {cid}.");
@@ -1715,18 +1815,6 @@ impl ConnectomeAtlasApp {
                 let scale = (r.height() / (ext * 2.15))
                     .min(r.width() / (ext * 2.35))
                     .max(0.45);
-
-                if resp.clicked() || resp.dragged() {
-                    if let Some(ptr) = resp.interact_pointer_pos() {
-                        let u_mm = ((ptr.x - cx) / scale).clamp(-ext, ext);
-                        let v_mm = ((cy - ptr.y) / scale).clamp(-ext, ext);
-                        match mode {
-                            0 => { self.slice_x_mm = u_mm; self.slice_y_mm = v_mm; }
-                            1 => { self.slice_x_mm = u_mm; self.slice_z_mm = v_mm; }
-                            _ => { self.slice_y_mm = u_mm; self.slice_z_mm = v_mm; }
-                        }
-                    }
-                }
 
                 // Species-accurate anatomical cross-section contours
                 let contours = generate_2d_slice_contours(&self.atlas.id, mode, slice_v);
@@ -1789,6 +1877,11 @@ impl ConnectomeAtlasApp {
                 }
 
                 let slab_half = if ext > 80.0 { 28.0 } else { 24.0 };
+                let hover_pos = resp.hover_pos();
+                let click_pos = if resp.clicked() { resp.interact_pointer_pos() } else { None };
+                let mut hovered_best: Option<(f32, String)> = None;
+                let mut clicked_best: Option<(f32, String)> = None;
+
                 for reg in &self.atlas.regions {
                     let (u, v, ortho) = match mode {
                         0 => (reg.coord[0], reg.coord[1], reg.coord[2]),
@@ -1799,7 +1892,58 @@ impl ConnectomeAtlasApp {
                         let rgb = parse_hex_color(&reg.color_hex);
                         let pos = Pos2::new(cx + u * scale, cy - v * scale);
                         painter.circle_filled(pos, 3.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                        if self.atlas.ablated_regions.contains(&reg.id) {
+                            painter.circle_stroke(
+                                pos,
+                                4.8_f32,
+                                Stroke::new(1.5_f32, Color32::from_rgb(239, 68, 68)),
+                            );
+                        }
+                        if self.selected_region.as_deref() == Some(reg.id.as_str()) {
+                            painter.circle_stroke(
+                                pos,
+                                5.2_f32,
+                                Stroke::new(1.6_f32, Color32::WHITE),
+                            );
+                        }
+                        if let Some(hp) = hover_pos {
+                            let d = hp.distance(pos);
+                            if d <= 7.5_f32 && hovered_best.as_ref().map_or(true, |(bd, _)| d < *bd) {
+                                hovered_best = Some((
+                                    d,
+                                    format!(
+                                        "{} — {}\n{} | ({:.1}, {:.1}, {:.1}) mm",
+                                        reg.id, reg.name, reg.network, reg.coord[0], reg.coord[1], reg.coord[2]
+                                    ),
+                                ));
+                            }
+                        }
+                        if let Some(cp) = click_pos {
+                            let d = cp.distance(pos);
+                            if d <= 7.5_f32 && clicked_best.as_ref().map_or(true, |(bd, _)| d < *bd) {
+                                clicked_best = Some((d, reg.id.clone()));
+                            }
+                        }
                     }
+                }
+
+                if let Some((_, rid)) = clicked_best {
+                    self.select_region(rid.clone(), true);
+                    self.status_msg = format!("Selected region {rid} from 2D slice.");
+                } else if resp.clicked() || resp.dragged() {
+                    if let Some(ptr) = resp.interact_pointer_pos() {
+                        let u_mm = ((ptr.x - cx) / scale).clamp(-ext, ext);
+                        let v_mm = ((cy - ptr.y) / scale).clamp(-ext, ext);
+                        match mode {
+                            0 => { self.slice_x_mm = u_mm; self.slice_y_mm = v_mm; }
+                            1 => { self.slice_x_mm = u_mm; self.slice_z_mm = v_mm; }
+                            _ => { self.slice_y_mm = u_mm; self.slice_z_mm = v_mm; }
+                        }
+                    }
+                }
+
+                if let Some((_, tip)) = hovered_best {
+                    resp.on_hover_text(tip);
                 }
 
                 let (ch_u, ch_v) = match mode {
@@ -2073,4 +2217,109 @@ pub fn render_headless_screenshot(
     drop(mapped);
     staging.unmap();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_region_syncs_slices_and_refreshes_domain_decode() {
+        let mut app = ConnectomeAtlasApp::new_headless(0);
+        let broca = app
+            .atlas
+            .regions
+            .iter()
+            .find(|r| r.id == "LANG.Broca_L")
+            .expect("LANG.Broca_L exists in human preset")
+            .clone();
+
+        app.select_region("LANG.Broca_L".to_string(), true);
+        assert_eq!(app.selected_region.as_deref(), Some("LANG.Broca_L"));
+        assert!((app.slice_x_mm - broca.coord[0]).abs() < 1e-4);
+        assert!((app.slice_y_mm - broca.coord[1]).abs() < 1e-4);
+        assert!((app.slice_z_mm - broca.coord[2]).abs() < 1e-4);
+        assert!(!app.domain_decode.is_empty());
+        let lang_entry = app
+            .domain_decode
+            .iter()
+            .find(|d| d.domain_label == "Language & Semantic")
+            .expect("Language & Semantic domain entry present");
+        assert!(
+            (lang_entry.score - 0.88).abs() < 1e-6 && !lang_entry.is_lesion_disruption,
+            "domain_decode should boost Language & Semantic for LANG.Broca_L, got {:?}",
+            lang_entry
+        );
+    }
+
+    #[test]
+    fn switching_receptor_channel_updates_control_harmonics() {
+        let mut app = ConnectomeAtlasApp::new_headless(0);
+        app.agonist_gain = 1.0;
+        for ch in ["ht", "da", "gaba"] {
+            app.receptor_channel = ch.to_string();
+            app.recompute();
+            assert_eq!(app.control_harmonics.receptor_channel, ch);
+        }
+    }
+
+    #[test]
+    fn headless_f1_and_escape_shortcuts_toggle_and_cascade() {
+        let ctx = egui::Context::default();
+        let mut app = ConnectomeAtlasApp::new_headless(0);
+        assert!(!app.show_about_window);
+
+        let run_key = |app: &mut ConnectomeAtlasApp, key: Option<egui::Key>| {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 900.0),
+                )),
+                ..Default::default()
+            };
+            if let Some(k) = key {
+                raw.events.push(egui::Event::Key {
+                    key: k,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = ctx.run(raw, |ctx| {
+                app.ui_step(ctx, false);
+            });
+        };
+
+        run_key(&mut app, None);
+        run_key(&mut app, Some(egui::Key::F1));
+        assert!(app.show_about_window, "F1 should open About window");
+        run_key(&mut app, Some(egui::Key::F1));
+        assert!(!app.show_about_window, "F1 should toggle About window closed");
+
+        // Escape cascade: cmd_palette_open -> show_about_window -> fly_ctrl.active -> zen_mode
+        app.cmd_palette_open = true;
+        app.show_about_window = true;
+        app.fly_ctrl.active = true;
+        app.zen_mode = true;
+        app.show_left_panel = false;
+        app.show_right_panel = false;
+        app.show_bottom_slices = false;
+
+        run_key(&mut app, Some(egui::Key::Escape));
+        assert!(!app.cmd_palette_open);
+        assert!(app.show_about_window);
+
+        run_key(&mut app, Some(egui::Key::Escape));
+        assert!(!app.show_about_window);
+        assert!(app.fly_ctrl.active);
+
+        run_key(&mut app, Some(egui::Key::Escape));
+        assert!(!app.fly_ctrl.active);
+        assert!(app.zen_mode);
+
+        run_key(&mut app, Some(egui::Key::Escape));
+        assert!(!app.zen_mode);
+        assert!(app.show_left_panel && app.show_right_panel && app.show_bottom_slices);
+    }
 }

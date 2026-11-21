@@ -1,0 +1,29 @@
+\documentclass[10pt,letterpaper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=0.65in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\title{\textbf{ConnectomeAtlas: Standalone 3D Multi-Scale Brain Connectome, Persistent Homology, and Lesion Workstation in Rust}}
+\author{Bryan P. White (ORCID: \href{https://orcid.org/0000-0003-4191-3511}{0000-0003-4191-3511}) \\ CRV Science Labs \\ \small CRV Science Apps Hub: \url{https://crvscience.com/apps} \\ \small DOI: \href{https://doi.org/10.5281/zenodo.24359109}{10.5281/zenodo.24359109}}
+\date{November 2026 \\ \small Preprint ID: APP-PREPRINT-21 (v0.8.0 Software Preprint) \\ \small Categories: q-bio.NC \textbullet{} cs.SI \textbullet{} cs.GR}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+ConnectomeAtlas (v0.8.0) is an open-source, multi-scale 3D brain connectome and neuroinformatics workstation written in Rust across a five-crate workspace under GPL-3.0-or-later licensing. Unifying four curated anatomical presets spanning three orders of nervous-system complexity---Human MNI152 Macro-Connectome (40 regions, 62 tract systems), Mouse Allen CCFv3 (28 regions, 39 pathways), Drosophila melanogaster FlyWire (22 neuropils, 32 projections), and Caenorhabditis elegans WormAtlas (26 ganglion/nerve-cord nodes, 35 pathways)---the workstation pairs species-authentic procedural 3D anatomy meshes (gyral cortical hemispheres with surgical octant cutaway, foliated cerebellum, brainstem, corpus callosum, rodent olfactory bulbs, insect optic lobes and central complex, and C. elegans cuticle, two-bulb pharynx, and nerve ring) and synchronized 2D triplanar slice contours with weighted graph efficiency, clustering, rich-club coefficient, communicability, Kinouchi-Copelli excitable criticality (branching ratio sigma and dynamic range Delta), Jacobi symmetric control harmonics, and exact Z2 first-Betti (beta1) persistent homology within a deterministic CLI and interactive wgpu/egui 3D viewer. Verified across 12 workspace tests and binary CLI sweeps, all four species operate near criticality (sigma = 1.000, dynamic range 21.923--23.857 dB), with FlyWire attaining the strongest rich-club backbone (0.38095) and highest dynamic range (23.857 dB), C. elegans exhibiting peak clustering (0.28883), and Human MNI152 hosting 14 persistent beta1 topological cavities (max persistence 0.85). Simulated Human MNI152 lesions quantify cascading efficiency loss: severing the Cingulum Bundle lowers global efficiency to 80.34\% (0.26475 to 0.21269, fragmenting into 2 components), severing the Corpus Callosum retains 87.82\%, and ablating Posterior Cingulate hub DMN.PCC retains 88.31\%, complemented by native NIfTI-1, TrackVis, SQLite WAL, SWC, and SHA-256 signed envelope I/O.
+\end{abstract}
+
+\section{Background and Software Architecture}
+Standalone 3D brain and multi-scale connectome workstation uniting human MNI152, mouse CCFv3, Drosophila FlyWire, and C. elegans WormAtlas presets with structural graph metrics, criticality branching, Z2 persistent homology, lesion analysis, and NIfTI/TrackVis I/O. Open-source code, documentation, and peer applications are indexed on the CRV Science Apps hub at \url{https://crvscience.com/apps}.
+
+\section{Headless Validation Summary}
+All headless integration tests were executed via \texttt{cargo test} and archived directly inside the public repository.
+
+\begin{thebibliography}{10}
+
+\end{thebibliography}
+\end{document}

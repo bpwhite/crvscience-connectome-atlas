@@ -84,6 +84,8 @@ enum Commands {
         from: String,
         #[arg(long)]
         to: String,
+        #[arg(long, default_value_t = 9.6)]
+        velocity: f64,
     },
     /// Simulate structural lesion impact after severing a tract or ablating a region
     Lesion {
@@ -165,9 +167,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tda = atlas.compute_topology_tda_report(min_weight);
                 println!("{}", serde_json::to_string_pretty(&tda)?);
             }
-            Commands::Path { preset, from, to } => {
-                let atlas = load_preset_by_id(&preset)
+            Commands::Path {
+                preset,
+                from,
+                to,
+                velocity,
+            } => {
+                let mut atlas = load_preset_by_id(&preset)
                     .ok_or_else(|| format!("Unknown preset '{preset}'"))?;
+                atlas.conduction_velocity_m_s = velocity;
                 match atlas.shortest_signaling_path(&from, &to, 0.0) {
                     Some(res) => println!("{}", serde_json::to_string_pretty(&res)?),
                     None => {

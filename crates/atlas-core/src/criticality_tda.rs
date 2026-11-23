@@ -110,32 +110,106 @@ pub struct TopologyTdaReport {
     pub node_profiles: Vec<NodeTopologyTdaProfile>,
 }
 
-fn dominant_eigenpair(sym_mat: &[Vec<f64>], iters: usize) -> (f64, Vec<f64>) {
-    let n = sym_mat.len();
+fn mat_vec_mul(mat: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
+    let n = mat.len();
+    let mut out = vec![0.0_f64; n];
+    for i in 0..n {
+        let mut s = 0.0_f64;
+        for j in 0..n {
+            s += mat[i][j] * v[j];
+        }
+        out[i] = s;
+    }
+    out
+}
+
+fn rayleigh_and_residual(mat: &[Vec<f64>], v: &[f64]) -> (f64, f64, f64, Vec<f64>) {
+    let av = mat_vec_mul(mat, v);
+    let norm = av.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let rayleigh: f64 = v.iter().zip(av.iter()).map(|(vi, avi)| vi * avi).sum();
+    let res = v
+        .iter()
+        .zip(av.iter())
+        .map(|(vi, avi)| {
+            let d = avi - rayleigh * vi;
+            d * d
+        })
+        .sum::<f64>()
+        .sqrt();
+    (rayleigh, norm, res, av)
+}
+
+/// Power iteration with Rayleigh-quotient residual convergence check and shifted
+/// Perron refinement fallback for oscillatory/periodic spectra.
+fn dominant_eigenpair_with_residual(mat: &[Vec<f64>], iters: usize) -> (f64, Vec<f64>, f64) {
+    let n = mat.len();
     if n == 0 {
-        return (0.0, Vec::new());
+        return (0.0, Vec::new(), 0.0);
+    }
+    let max_abs = mat
+        .iter()
+        .flat_map(|row| row.iter())
+        .fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+    if max_abs <= 1e-12 {
+        return (0.0, vec![0.0; n], 0.0);
     }
     let mut v = vec![1.0 / (n as f64).sqrt(); n];
-    let mut lambda = 0.0;
-    for _ in 0..iters {
-        let mut next = vec![0.0; n];
-        for i in 0..n {
-            let mut s = 0.0;
-            for j in 0..n {
-                s += sym_mat[i][j] * v[j];
-            }
-            next[i] = s;
-        }
-        let norm: f64 = next.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let mut lambda = 0.0_f64;
+    let mut residual = f64::INFINITY;
+    let max_iters = iters.max(128);
+    let mut converged = false;
+
+    for _ in 0..max_iters {
+        let (rayleigh, norm, res, mut next) = rayleigh_and_residual(mat, &v);
         if norm <= 1e-12 {
-            return (0.0, vec![0.0; n]);
+            return (0.0, vec![0.0; n], 0.0);
         }
-        lambda = norm;
+        lambda = rayleigh;
+        residual = res;
         for x in &mut next {
             *x /= norm;
         }
         v = next;
+        if residual <= 1e-10 * norm.max(1.0) {
+            converged = true;
+            break;
+        }
     }
+
+    if !converged {
+        let shift = 0.25 * max_abs.max(0.1);
+        for _ in 0..max_iters {
+            let av = mat_vec_mul(mat, &v);
+            let mut shifted: Vec<f64> = av
+                .iter()
+                .zip(v.iter())
+                .map(|(avi, vi)| avi + shift * vi)
+                .collect();
+            let snorm = shifted.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if snorm <= 1e-12 {
+                return (0.0, vec![0.0; n], 0.0);
+            }
+            for x in &mut shifted {
+                *x /= snorm;
+            }
+            v = shifted;
+            let (rayleigh, norm, res, _) = rayleigh_and_residual(mat, &v);
+            if norm <= 1e-12 {
+                return (0.0, vec![0.0; n], 0.0);
+            }
+            lambda = rayleigh;
+            residual = res;
+            if residual <= 1e-10 * norm.max(1.0) {
+                break;
+            }
+        }
+    }
+
+    (lambda.max(0.0), v, residual)
+}
+
+fn dominant_eigenpair(mat: &[Vec<f64>], iters: usize) -> (f64, Vec<f64>) {
+    let (lambda, v, _) = dominant_eigenpair_with_residual(mat, iters);
     (lambda, v)
 }
 
@@ -258,6 +332,41 @@ fn evaluate_dynamic_range_at_kappa(
 }
 
 impl ConnectomeAtlas {
+    /// Builds the E/I-weighted propagation matrix `g[target][source]`, preserving directed
+    /// branching asymmetry (`directed == true` populates only `source -> target`).
+    fn build_ei_coupling_matrix(
+        &self,
+        idx_of: &BTreeMap<&str, usize>,
+        ei_intact: &[f64],
+        min_weight: f64,
+        apply_lesions: bool,
+    ) -> Vec<Vec<f64>> {
+        let n = self.regions.len();
+        let mut g = vec![vec![0.0_f64; n]; n];
+        for e in &self.edges {
+            let intact = if apply_lesions {
+                self.is_edge_intact(e, min_weight)
+            } else {
+                e.weight >= min_weight
+            };
+            if !intact {
+                continue;
+            }
+            if let (Some(&u), Some(&v)) = (idx_of.get(e.source.as_str()), idx_of.get(e.target.as_str())) {
+                if u != v {
+                    let w_eff = e.weight * (ei_intact[u] * ei_intact[v]).sqrt();
+                    if w_eff > g[v][u] {
+                        g[v][u] = w_eff;
+                    }
+                    if !e.directed && w_eff > g[u][v] {
+                        g[u][v] = w_eff;
+                    }
+                }
+            }
+        }
+        g
+    }
+
     /// Computes the Brain Criticality Observatory report: E/I-modulated branching ratio `sigma`,
     /// Kinouchi-Copelli sigmoidal response curve `F(h)`, and dynamic range `Delta` (dB).
     pub fn compute_criticality_report(&self, min_weight: f64, coupling_kappa: f64) -> CriticalityReport {
@@ -276,22 +385,8 @@ impl ConnectomeAtlas {
             ei_intact[i] = (0.65 + 0.35 * ratio).clamp(0.58, 1.42);
         }
 
-        let mut g_intact = vec![vec![0.0_f64; n]; n];
-        for e in &self.edges {
-            if e.weight < min_weight {
-                continue;
-            }
-            if let (Some(&u), Some(&v)) = (idx_of.get(e.source.as_str()), idx_of.get(e.target.as_str())) {
-                if u != v {
-                    let w_eff = e.weight * (ei_intact[u] * ei_intact[v]).sqrt();
-                    if w_eff > g_intact[u][v] {
-                        g_intact[u][v] = w_eff;
-                        g_intact[v][u] = w_eff;
-                    }
-                }
-            }
-        }
-        let (intact_rho, _) = dominant_eigenpair(&g_intact, 28);
+        let g_intact = self.build_ei_coupling_matrix(&idx_of, &ei_intact, min_weight, false);
+        let (intact_rho, _) = dominant_eigenpair(&g_intact, 128);
         let norm_denom = intact_rho.max(0.15);
 
         let mut active_idxs = Vec::new();
@@ -301,21 +396,7 @@ impl ConnectomeAtlas {
             }
         }
 
-        let mut g_active = vec![vec![0.0_f64; n]; n];
-        for e in &self.edges {
-            if !self.is_edge_intact(e, min_weight) {
-                continue;
-            }
-            if let (Some(&u), Some(&v)) = (idx_of.get(e.source.as_str()), idx_of.get(e.target.as_str())) {
-                if u != v {
-                    let w_eff = e.weight * (ei_intact[u] * ei_intact[v]).sqrt();
-                    if w_eff > g_active[u][v] {
-                        g_active[u][v] = w_eff;
-                        g_active[v][u] = w_eff;
-                    }
-                }
-            }
-        }
+        let g_active = self.build_ei_coupling_matrix(&idx_of, &ei_intact, min_weight, true);
 
         let kappa = coupling_kappa.clamp(0.35, 2.0);
         if active_idxs.len() < 2 {
@@ -334,7 +415,7 @@ impl ConnectomeAtlas {
             };
         }
 
-        let (cur_rho, dom_vec) = dominant_eigenpair(&g_active, 28);
+        let (cur_rho, dom_vec) = dominant_eigenpair(&g_active, 128);
         let sigma = kappa * (cur_rho.max(0.0) / norm_denom);
         let (f0, f_max, r10, r90, delta_db, response_curve, snapshots) =
             evaluate_dynamic_range_at_kappa(&g_active, &active_idxs, norm_denom, kappa, 22);
@@ -679,7 +760,11 @@ impl ConnectomeAtlas {
 
 #[cfg(test)]
 mod tests {
-    use crate::presets::all_presets;
+    use super::*;
+    use crate::model::{
+        AtlasScale, BrainRegion, Hemisphere, PathwayEdge, PathwayModality, ReceptorProfile,
+    };
+    use crate::presets::{all_presets, load_preset_by_id};
 
     #[test]
     fn criticality_dynamic_range_peaks_near_critical_kappa() {
@@ -689,8 +774,12 @@ mod tests {
             let sup = atlas.compute_criticality_report(0.0, 1.75);
             assert!((crit.branching_ratio_sigma - 1.0).abs() < 0.05);
             assert!(crit.dynamic_range_db > sub.dynamic_range_db);
-            if atlas.id != "celegans_wormatlas" {
+            // Recurrent macro/mesoscale/nematode nets collapse dynamic range by kappa=1.75;
+            // Drosophila's largely directed feedforward sensory lobes keep F0 localized in CX.
+            if atlas.id != "drosophila_flywire" {
                 assert!(crit.dynamic_range_db > sup.dynamic_range_db);
+            } else {
+                assert!(sup.spontaneous_floor_f0 < 0.04);
             }
             assert!(sup.spontaneous_floor_f0 > crit.spontaneous_floor_f0);
         }
@@ -706,6 +795,99 @@ mod tests {
                 assert!(cav.cycle_nodes.len() >= 3);
                 assert!(cav.persistence >= 0.0);
             }
+        }
+    }
+
+    #[test]
+    fn dominant_eigenpair_checks_residual_and_preserves_directed_asymmetry() {
+        // Weighted directed 3-cycle: asymmetric weights converge cleanly with tiny residual
+        let asym = vec![
+            vec![0.0, 0.0, 0.8],
+            vec![1.2, 0.0, 0.0],
+            vec![0.0, 0.5, 0.0],
+        ];
+        let (lam, vec, res) = dominant_eigenpair_with_residual(&asym, 128);
+        let expected_lam = (0.8_f64 * 1.2 * 0.5).cbrt();
+        assert!((lam - expected_lam).abs() < 1e-8, "got {lam} vs {expected_lam}");
+        assert!(res < 1e-8, "residual too large: {res}");
+        assert_eq!(vec.len(), 3);
+
+        // Pure feedforward DAG has zero recurrent spectral radius (sigma == 0)
+        let mk_reg = |id: &str| BrainRegion {
+            id: id.to_string(),
+            name: id.to_string(),
+            network: "Net".to_string(),
+            hemisphere: Hemisphere::Midline,
+            coord: [0.0, 0.0, 0.0],
+            radius_mm: 4.0,
+            color_hex: "#38bdf8".to_string(),
+            citation_url: String::new(),
+            notes: String::new(),
+            what_it_does: String::new(),
+            inputs_prose: String::new(),
+            outputs_prose: String::new(),
+            receptors: ReceptorProfile::default(),
+        };
+        let dag = ConnectomeAtlas {
+            id: "dag".to_string(),
+            title: "DAG".to_string(),
+            organism: "Test".to_string(),
+            coordinate_space: "Test".to_string(),
+            scale: AtlasScale::CellularCompleteConnectome,
+            reference_summary: String::new(),
+            primary_citation_url: String::new(),
+            benchmark_neurons_or_parcels: String::new(),
+            benchmark_synapses_or_tracts: String::new(),
+            conduction_velocity_m_s: 9.6,
+            regions: vec![mk_reg("S"), mk_reg("I"), mk_reg("M")],
+            edges: vec![
+                PathwayEdge {
+                    source: "S".to_string(),
+                    target: "I".to_string(),
+                    weight: 0.9,
+                    tract_name: "Chem".to_string(),
+                    modality: PathwayModality::ChemicalSynapse,
+                    directed: true,
+                    synapse_count_est: None,
+                },
+                PathwayEdge {
+                    source: "I".to_string(),
+                    target: "M".to_string(),
+                    weight: 0.9,
+                    tract_name: "Chem".to_string(),
+                    modality: PathwayModality::ChemicalSynapse,
+                    directed: true,
+                    synapse_count_est: None,
+                },
+            ],
+            ablated_regions: BTreeSet::new(),
+            severed_tracts: BTreeSet::new(),
+        };
+        let dag_rep = dag.compute_criticality_report(0.0, 1.0);
+        assert!(
+            dag_rep.branching_ratio_sigma < 1e-9,
+            "Directed feedforward DAG must have sigma = 0, got {}",
+            dag_rep.branching_ratio_sigma
+        );
+
+        // On FlyWire and WormAtlas, preserving directed edges produces asymmetric propagation
+        for pid in ["drosophila_flywire", "celegans_wormatlas"] {
+            let atlas = load_preset_by_id(pid).expect("preset");
+            let mut idx_of = BTreeMap::new();
+            for (i, r) in atlas.regions.iter().enumerate() {
+                idx_of.insert(r.id.as_str(), i);
+            }
+            let ei = vec![1.0_f64; atlas.regions.len()];
+            let g = atlas.build_ei_coupling_matrix(&idx_of, &ei, 0.0, true);
+            let mut has_asym = false;
+            for i in 0..g.len() {
+                for j in (i + 1)..g.len() {
+                    if (g[i][j] - g[j][i]).abs() > 1e-6 {
+                        has_asym = true;
+                    }
+                }
+            }
+            assert!(has_asym, "{pid} coupling matrix must preserve directed asymmetry");
         }
     }
 }

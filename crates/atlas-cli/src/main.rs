@@ -68,6 +68,8 @@ enum Commands {
         from: String,
         #[arg(long)]
         to: String,
+        #[arg(long, default_value_t = 9.6)]
+        velocity: f64,
     },
     /// Run receptor-informed network control theory (average/modal controllability & transition energy)
     Control {
@@ -261,17 +263,24 @@ Top Rich-Club Hubs:");
                 println!("  <-> {:<17} w={:.2} ({})", peer, e.weight, e.tract_name);
             }
         }
-        Commands::ShortestPath { preset, from, to } => {
-            let atlas = load_preset_by_id(&preset)
+        Commands::ShortestPath {
+            preset,
+            from,
+            to,
+            velocity,
+        } => {
+            let mut atlas = load_preset_by_id(&preset)
                 .ok_or_else(|| format!("Unknown preset '{preset}'"))?;
+            atlas.conduction_velocity_m_s = velocity;
             match atlas.shortest_signaling_path(&from, &to, 0.0) {
                 Some(res) => {
                     println!("Signaling Path: {}", res.hops.join(" -> "));
                     println!(
-                        "Hops: {} | Latency: {:.2} ms ({:.1} mm @ 9.6 m/s) | Weighted Cost: {:.4} | Bottleneck Weight: {:.3}",
+                        "Hops: {} | Latency: {:.2} ms ({:.1} mm @ {:.1} m/s) | Weighted Cost: {:.4} | Bottleneck Weight: {:.3}",
                         res.hops.len().saturating_sub(1),
                         res.conduction_latency_ms,
                         res.arc_length_mm,
+                        atlas.conduction_velocity_m_s,
                         res.total_distance_cost,
                         res.bottleneck_weight
                     );
@@ -397,8 +406,13 @@ Top Rich-Club Hubs:");
             let nb = atlas.compute_systems_neuro_report(0.0, seed).null_benchmark;
             println!("Maslov-Sneppen & Betzel-Sporns Generative Null Benchmark ({preset}):");
             println!(
-                "  Small-Worldness sigma = {:.3}x | Rich-Club Phi_norm = {:.3}x | Wiring Cost vs Null = {:+.2}%",
-                nb.small_world_sigma, nb.rich_club_normalized, nb.wiring_cost_saving_pct
+                "  Small-Worldness sigma = {:.3}x (C0={:.3}, L={:.3}, L0={:.3}) | Rich-Club Phi_norm = {:.3}x | Wiring Cost vs Null = {:+.2}%",
+                nb.small_world_sigma,
+                nb.null_clustering_coeff,
+                nb.obs_characteristic_path_length,
+                nb.null_characteristic_path_length,
+                nb.rich_club_normalized,
+                nb.wiring_cost_saving_pct
             );
             println!(
                 "  Generative Fit (E_ij ~ D^-eta * K^gamma): eta* = {:.2}, gamma* = {:.2} (Discrepancy = {:.3})",

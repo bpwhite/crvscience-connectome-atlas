@@ -154,6 +154,10 @@ pub struct PathwayEdge {
     pub synapse_count_est: Option<u64>,
 }
 
+fn default_conduction_velocity_m_s() -> f64 {
+    9.6
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectomeAtlas {
     pub id: String,
@@ -165,6 +169,8 @@ pub struct ConnectomeAtlas {
     pub primary_citation_url: String,
     pub benchmark_neurons_or_parcels: String,
     pub benchmark_synapses_or_tracts: String,
+    #[serde(default = "default_conduction_velocity_m_s")]
+    pub conduction_velocity_m_s: f64,
     pub regions: Vec<BrainRegion>,
     pub edges: Vec<PathwayEdge>,
     pub ablated_regions: BTreeSet<String>,

@@ -31,7 +31,8 @@ pub use streamlines::{
     TractRenderStyle,
 };
 pub use surfaces_and_glyphs::{
-    classify_region_organoid, compute_atlas_fiber_tensors, is_point_clipped_by_cutaway,
-    project_parcel_scalars_to_surface, LocalFiberTensor, OrganoidClass, SurgicalCutawayMode,
+    classify_region_organoid, compute_atlas_fiber_tensors, generate_tensor_ellipsoid_mesh,
+    is_point_clipped_by_cutaway, project_parcel_scalars_to_surface, LocalFiberTensor,
+    OrganoidClass, SurgicalCutawayMode, TensorEllipsoidMesh,
 };
 pub use wgpu_pipeline::{encode_view_uniform_bytes, shader_descriptor, WGSL_CONNECTOME_SHADER};

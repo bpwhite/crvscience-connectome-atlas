@@ -129,11 +129,104 @@ pub struct LocalFiberTensor {
     pub region_id: String,
     pub eigenvalues: [f64; 3],
     pub principal_axis: [f32; 3],
+    #[serde(default)]
+    pub secondary_axis: [f32; 3],
+    #[serde(default)]
+    pub tertiary_axis: [f32; 3],
     pub fractional_anisotropy: f64,
     pub westin_linear_cl: f64,
     pub westin_planar_cp: f64,
     pub westin_spherical_cs: f64,
     pub superquadric_alpha_beta: [f64; 2],
+}
+
+/// Shaded 3D ellipsoidal diffusion-tensor glyph mesh plus orthogonal principal-axis segments.
+#[derive(Debug, Clone)]
+pub struct TensorEllipsoidMesh {
+    pub vertices: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub triangles: Vec<[u32; 3]>,
+    pub axis_segments: [([f32; 3], [f32; 3]); 3],
+}
+
+/// Generates a 3-axis ellipsoidal diffusion-tensor glyph aligned to `(e1, e2, e3)` and scaled by
+/// normalized semi-axes `sqrt(lambda_k / lambda_1)` (with a minimum floor for visibility).
+pub fn generate_tensor_ellipsoid_mesh(
+    center: [f32; 3],
+    tensor: &LocalFiberTensor,
+    max_radius_mm: f32,
+    lat_rings: usize,
+    lon_sectors: usize,
+) -> TensorEllipsoidMesh {
+    let l1 = tensor.eigenvalues[0].max(1e-5);
+    let l2 = tensor.eigenvalues[1].max(1e-5);
+    let l3 = tensor.eigenvalues[2].max(1e-5);
+    let r1 = max_radius_mm.max(1.0);
+    let r2 = (r1 * ((l2 / l1).sqrt() as f32)).max(r1 * 0.24);
+    let r3 = (r1 * ((l3 / l1).sqrt() as f32)).max(r1 * 0.20);
+
+    let e1 = Vec3::from_array(tensor.principal_axis).normalize_or_zero();
+    let e1 = if e1.length_squared() < 1e-6 { Vec3::X } else { e1 };
+    let e2_raw = Vec3::from_array(tensor.secondary_axis);
+    let e2 = (e2_raw - e1 * e2_raw.dot(e1)).normalize_or_zero();
+    let e2 = if e2.length_squared() < 1e-6 {
+        let ref_v = if e1.z.abs() < 0.85 { Vec3::Z } else { Vec3::Y };
+        e1.cross(ref_v).normalize()
+    } else {
+        e2
+    };
+    let e3 = e1.cross(e2).normalize_or_zero();
+    let c = Vec3::from_array(center);
+
+    let rings = lat_rings.max(3);
+    let sectors = lon_sectors.max(6);
+    let mut vertices = Vec::with_capacity((rings + 1) * sectors);
+    let mut normals = Vec::with_capacity((rings + 1) * sectors);
+    let mut triangles = Vec::with_capacity(rings * sectors * 2);
+
+    for i in 0..=rings {
+        let v = (i as f32) / (rings as f32);
+        let phi = (v - 0.5) * std::f32::consts::PI;
+        let cp = phi.cos();
+        let sp = phi.sin();
+        for j in 0..sectors {
+            let theta = (j as f32 / sectors as f32) * std::f32::consts::TAU;
+            let ct = theta.cos();
+            let st = theta.sin();
+            let lx = r1 * cp * ct;
+            let ly = r2 * cp * st;
+            let lz = r3 * sp;
+            let pos = c + e1 * lx + e2 * ly + e3 * lz;
+            let nrm = (e1 * (lx / (r1 * r1)) + e2 * (ly / (r2 * r2)) + e3 * (lz / (r3 * r3)))
+                .normalize_or_zero();
+            vertices.push(pos.to_array());
+            normals.push(nrm.to_array());
+        }
+    }
+
+    for i in 0..rings {
+        let row0 = (i * sectors) as u32;
+        let row1 = ((i + 1) * sectors) as u32;
+        for j in 0..sectors {
+            let j0 = j as u32;
+            let j1 = ((j + 1) % sectors) as u32;
+            triangles.push([row0 + j0, row0 + j1, row1 + j1]);
+            triangles.push([row0 + j0, row1 + j1, row1 + j0]);
+        }
+    }
+
+    let axis_segments = [
+        ((c - e1 * r1).to_array(), (c + e1 * r1).to_array()),
+        ((c - e2 * r2).to_array(), (c + e2 * r2).to_array()),
+        ((c - e3 * r3).to_array(), (c + e3 * r3).to_array()),
+    ];
+
+    TensorEllipsoidMesh {
+        vertices,
+        normals,
+        triangles,
+        axis_segments,
+    }
 }
 
 /// Computes local 3x3 symmetric fiber orientation tensors, Fractional Anisotropy (`FA`),
@@ -201,6 +294,16 @@ pub fn compute_atlas_fiber_tensors(
                 evecs[1][2] as f32,
                 evecs[2][2] as f32,
             ],
+            secondary_axis: [
+                evecs[0][1] as f32,
+                evecs[1][1] as f32,
+                evecs[2][1] as f32,
+            ],
+            tertiary_axis: [
+                evecs[0][0] as f32,
+                evecs[1][0] as f32,
+                evecs[2][0] as f32,
+            ],
             fractional_anisotropy: fa,
             westin_linear_cl: cl,
             westin_planar_cp: cp,
@@ -225,7 +328,15 @@ mod tests {
             assert!((0.0..=1.0).contains(&t.fractional_anisotropy));
             let sum_westin = t.westin_linear_cl + t.westin_planar_cp + t.westin_spherical_cs;
             assert!((sum_westin - 1.0).abs() < 1e-6);
+            let e1 = Vec3::from_array(t.principal_axis);
+            let e2 = Vec3::from_array(t.secondary_axis);
+            let e3 = Vec3::from_array(t.tertiary_axis);
+            assert!(e1.dot(e2).abs() < 1e-4 && e1.dot(e3).abs() < 1e-4 && e2.dot(e3).abs() < 1e-4);
         }
+        let glyph = generate_tensor_ellipsoid_mesh([10.0, 20.0, 30.0], &tensors[0], 6.0, 4, 8);
+        assert!(!glyph.vertices.is_empty());
+        assert!(!glyph.triangles.is_empty());
+        assert_eq!(glyph.axis_segments.len(), 3);
         assert!(is_point_clipped_by_cutaway(
             [-24.0, 30.0, 28.0],
             SurgicalCutawayMode::AnteriorSuperiorOctant,

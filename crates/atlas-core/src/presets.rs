@@ -236,6 +236,7 @@ pub fn human_mni152_atlas() -> ConnectomeAtlas {
         primary_citation_url: "https://pmc.ncbi.nlm.nih.gov/articles/PMC4990127/".to_string(),
         benchmark_neurons_or_parcels: "360 HCP-MMP1.0 cortical + 14 subcortical (166 AAL3v1)".to_string(),
         benchmark_synapses_or_tracts: "7 major tract systems (~200M callosal axons)".to_string(),
+        conduction_velocity_m_s: 9.6,
         regions,
         edges,
         ablated_regions: BTreeSet::new(),
@@ -337,6 +338,7 @@ pub fn mouse_ccfv3_atlas() -> ConnectomeAtlas {
         primary_citation_url: url_ccf.to_string(),
         benchmark_neurons_or_parcels: "43 isocortical + 314 subcortical structures (10 µm voxels)".to_string(),
         benchmark_synapses_or_tracts: "81 annotated white-matter fiber tracts + AAV viral projections".to_string(),
+        conduction_velocity_m_s: 9.6,
         regions,
         edges,
         ablated_regions: BTreeSet::new(),
@@ -429,6 +431,7 @@ pub fn drosophila_flywire_atlas() -> ConnectomeAtlas {
         primary_citation_url: url_fw.to_string(),
         benchmark_neurons_or_parcels: "139,255 proofread neurons across 78 neuropils".to_string(),
         benchmark_synapses_or_tracts: ">50,000,000 EM-reconstructed chemical synapses (>3,600 cell types)".to_string(),
+        conduction_velocity_m_s: 9.6,
         regions: regions
             .into_iter()
             .map(|mut r| {
@@ -536,6 +539,7 @@ pub fn celegans_wormatlas() -> ConnectomeAtlas {
         primary_citation_url: url_wa.to_string(),
         benchmark_neurons_or_parcels: "302 total neurons (282 somatic + 20 pharyngeal via RIPL/R)".to_string(),
         benchmark_synapses_or_tracts: "6,393 chemical synapses + 890 gap junctions + 1,410 NMJs".to_string(),
+        conduction_velocity_m_s: 9.6,
         regions,
         edges,
         ablated_regions: BTreeSet::new(),

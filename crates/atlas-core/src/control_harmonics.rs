@@ -169,6 +169,55 @@ pub fn solve_linear_system(mat_a: &[Vec<f64>], vec_b: &[f64]) -> Vec<f64> {
     x
 }
 
+/// Normalizes a symmetric connectivity matrix `A` by `1 + max_i |lambda_i|` so the
+/// discrete-time system `x(t+1) = A_norm x(t) + B u(t)` remains strictly Schur-stable
+/// even when `|lambda_min| > lambda_max`.
+pub fn normalize_adjacency_schur(
+    sym_w: &[Vec<f64>],
+) -> (Vec<f64>, Vec<Vec<f64>>, f64, Vec<Vec<f64>>) {
+    let n = sym_w.len();
+    let (w_evals, w_evecs) = jacobi_eigen_symmetric(sym_w, 24);
+    let rho_max = w_evals
+        .iter()
+        .map(|&ev| ev.abs())
+        .fold(0.0_f64, f64::max)
+        .max(0.1);
+    let scale_a = 1.0 / (1.0 + rho_max);
+    let mut a_norm = vec![vec![0.0_f64; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            a_norm[i][j] = sym_w[i][j] * scale_a;
+        }
+    }
+    (w_evals, w_evecs, scale_a, a_norm)
+}
+
+/// Computes per-node `(average_controllability, modal_controllability)` from a symmetric matrix's
+/// spectral decomposition `(w_evals, w_evecs, scale_a)` and diagonal input gains `b_diag`.
+pub fn node_controllability_from_spectrum(
+    w_evals: &[f64],
+    w_evecs: &[Vec<f64>],
+    scale_a: f64,
+    b_diag: &[f64],
+) -> Vec<(f64, f64)> {
+    let n = w_evals.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let bi2 = b_diag[i] * b_diag[i];
+        let mut avg_c = 0.0_f64;
+        let mut mod_c = 0.0_f64;
+        for m in 0..n {
+            let lam = w_evals[m] * scale_a;
+            let vim2 = w_evecs[i][m] * w_evecs[i][m];
+            let one_minus_l2 = (1.0 - lam * lam).max(1e-6);
+            avg_c += bi2 * (vim2 / one_minus_l2);
+            mod_c += one_minus_l2 * vim2;
+        }
+        out.push((avg_c, mod_c));
+    }
+    out
+}
+
 impl ConnectomeAtlas {
     /// Computes Receptor-Informed Network Control Theory (Gu et al. 2015; Singleton et al. 2022)
     /// and Normalized Graph Laplacian Connectome Harmonics (Margulies et al. 2016; Atasoy et al. 2016).
@@ -219,15 +268,7 @@ impl ConnectomeAtlas {
         let g1_col = non_zero_cols.first().copied().unwrap_or(0);
         let g2_col = non_zero_cols.get(1).copied().unwrap_or(g1_col);
 
-        let (w_evals, w_evecs) = jacobi_eigen_symmetric(&sym_w, 20);
-        let lambda_max = w_evals.last().copied().unwrap_or(1.0).max(0.1);
-        let scale_a = 1.0 / (1.0 + lambda_max);
-        let mut a_norm = vec![vec![0.0_f64; n]; n];
-        for i in 0..n {
-            for j in 0..n {
-                a_norm[i][j] = sym_w[i][j] * scale_a;
-            }
-        }
+        let (w_evals, w_evecs, scale_a, a_norm) = normalize_adjacency_schur(&sym_w);
 
         let (state_names, placebo_mat, placebo_mean, _) =
             self.eval_transition_energy_grid(&a_norm, receptor_channel, 0.0);
@@ -246,6 +287,7 @@ impl ConnectomeAtlas {
             0.0
         };
 
+        let ctrl_pairs = node_controllability_from_spectrum(&w_evals, &w_evecs, scale_a, &b_diag);
         let mut node_profiles = Vec::with_capacity(n);
         for i in 0..n {
             if self.ablated_regions.contains(&self.regions[i].id) {
@@ -258,15 +300,7 @@ impl ConnectomeAtlas {
                 });
                 continue;
             }
-            let bi2 = b_diag[i] * b_diag[i];
-            let mut avg_c = 0.0_f64;
-            let mut mod_c = 0.0_f64;
-            for m in 0..n {
-                let lam = w_evals[m] * scale_a;
-                let vim2 = w_evecs[i][m] * w_evecs[i][m];
-                avg_c += bi2 * (vim2 / (1.0 - lam * lam).max(1e-6));
-                mod_c += (1.0 - lam * lam) * vim2;
-            }
+            let (avg_c, mod_c) = ctrl_pairs[i];
             node_profiles.push(NodeControlHarmonicMetrics {
                 region_id: self.regions[i].id.clone(),
                 average_controllability: avg_c,
@@ -363,7 +397,7 @@ impl ConnectomeAtlas {
             }
             groups.entry(r.network.clone()).or_default().push(i);
         }
-        let state_names: Vec<String> = groups.keys().take(6).cloned().collect();
+        let state_names: Vec<String> = groups.keys().cloned().collect();
         let state_vecs: Vec<Vec<f64>> = state_names
             .iter()
             .map(|name| {
@@ -410,6 +444,7 @@ fn url_safe_finite(v: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::presets::human_mni152_atlas;
 
     #[test]
@@ -427,5 +462,35 @@ mod tests {
         }
         assert!(rep.node_profiles.iter().all(|p| p.average_controllability >= 1.0));
         assert!(rep.node_profiles.iter().all(|p| p.modal_controllability > 0.0));
+        let expected_nets = atlas.unique_networks();
+        assert_eq!(rep.state_names.len(), expected_nets.len());
+        assert!(rep.state_names.len() >= 8);
+        assert!(rep.state_names.iter().any(|s| s == "Visual"));
+        assert!(rep.state_names.iter().any(|s| s == "Sensorimotor"));
+        assert!(rep.state_names.iter().any(|s| s == "Subcortical & Limbic"));
+    }
+
+    #[test]
+    fn spectral_normalization_stays_schur_stable_when_abs_lambda_min_exceeds_lambda_max() {
+        // Eigenvalues of all-(-2) off-diagonal 3x3 symmetric matrix are [-4, +2, +2], so |lambda_min| = 4 > lambda_max = 2.
+        let sym = vec![
+            vec![0.0, -2.0, -2.0],
+            vec![-2.0, 0.0, -2.0],
+            vec![-2.0, -2.0, 0.0],
+        ];
+        let (evals, evecs, scale_a, a_norm) = normalize_adjacency_schur(&sym);
+        assert!((scale_a - (1.0 / 5.0)).abs() < 1e-9, "scale_a should be 1/(1+4)=0.2, got {scale_a}");
+        let (norm_evals, _) = jacobi_eigen_symmetric(&a_norm, 24);
+        let max_abs_norm = norm_evals.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        assert!(
+            max_abs_norm < 1.0,
+            "Normalized spectral radius must be < 1.0, got {max_abs_norm}"
+        );
+        let b_diag = vec![1.0; 3];
+        let ctrls = node_controllability_from_spectrum(&evals, &evecs, scale_a, &b_diag);
+        for (avg_c, mod_c) in ctrls {
+            assert!(avg_c >= 1.0 && avg_c.is_finite());
+            assert!(mod_c > 0.0 && mod_c < 1.0);
+        }
     }
 }

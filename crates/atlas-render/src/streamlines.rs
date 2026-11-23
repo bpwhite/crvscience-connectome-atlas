@@ -22,6 +22,22 @@ pub enum ColorSchemeMode {
     FunctionalNetwork,
     DtiDirectionalRgb,
     BetweennessHeatmap,
+    HarmonicModePsi,
+    CriticalitySusceptibility,
+    TdaBeta1Loops,
+}
+
+impl ColorSchemeMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FunctionalNetwork => "Functional Network",
+            Self::DtiDirectionalRgb => "DTI Directional RGB",
+            Self::BetweennessHeatmap => "Betweenness Heatmap",
+            Self::HarmonicModePsi => "Harmonic Mode psi_k",
+            Self::CriticalitySusceptibility => "Criticality sigma_i",
+            Self::TdaBeta1Loops => "TDA beta-1 Loops",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

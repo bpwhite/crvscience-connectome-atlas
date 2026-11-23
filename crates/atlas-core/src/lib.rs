@@ -24,7 +24,8 @@ pub mod presets;
 pub mod systems_neuro;
 
 pub use control_harmonics::{
-    jacobi_eigen_symmetric, ControlHarmonicsReport, NodeControlHarmonicMetrics,
+    jacobi_eigen_symmetric, node_controllability_from_spectrum, normalize_adjacency_schur,
+    ControlHarmonicsReport, NodeControlHarmonicMetrics,
 };
 pub use metrics::{AtlasSummaryMetrics, LesionDeltaReport, NodeTopologyMetrics, PathResult};
 pub use model::{

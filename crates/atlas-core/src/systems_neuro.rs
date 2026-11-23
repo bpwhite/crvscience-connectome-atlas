@@ -90,6 +90,12 @@ pub struct NullGenerativeBenchmark {
     pub generative_eta_distance: f64,
     pub generative_gamma_homophily: f64,
     pub generative_discrepancy: f64,
+    #[serde(default)]
+    pub obs_characteristic_path_length: f64,
+    #[serde(default)]
+    pub null_characteristic_path_length: f64,
+    #[serde(default)]
+    pub null_clustering_coeff: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +119,42 @@ fn dist_mm(a: [f32; 3], b: [f32; 3]) -> f64 {
     let dy = (b[1] - a[1]) as f64;
     let dz = (b[2] - a[2]) as f64;
     ((dx * dx + dy * dy + dz * dz).sqrt() * 1.15).max(2.0)
+}
+
+fn mean_weighted_path_length(
+    n: usize,
+    active_idxs: &[usize],
+    edges: &[(usize, usize, f64)],
+) -> (f64, bool) {
+    let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+    for &(u, v, w) in edges {
+        if u != v && w > 0.0 {
+            adj[u].push((v, w));
+            adj[v].push((u, w));
+        }
+    }
+    let mut finite_dist_sum = 0.0_f64;
+    let mut finite_pairs = 0_usize;
+    for &s in active_idxs {
+        let (dist, _, _, _) = crate::metrics::dijkstra_brandes_from(s, n, &adj);
+        for &t in active_idxs {
+            if s == t {
+                continue;
+            }
+            let d = dist[t];
+            if d.is_finite() && d > 0.0 {
+                finite_dist_sum += d;
+                finite_pairs += 1;
+            }
+        }
+    }
+    let expected_pairs = active_idxs.len() * active_idxs.len().saturating_sub(1);
+    let l = if finite_pairs > 0 {
+        finite_dist_sum / (finite_pairs as f64)
+    } else {
+        0.0
+    };
+    (l, expected_pairs > 0 && finite_pairs == expected_pairs)
 }
 
 impl ConnectomeAtlas {
@@ -327,8 +369,13 @@ impl ConnectomeAtlas {
                 generative_eta_distance: 1.6,
                 generative_gamma_homophily: 0.8,
                 generative_discrepancy: 0.18,
+                obs_characteristic_path_length: 0.0,
+                null_characteristic_path_length: 0.0,
+                null_clustering_coeff: 0.0,
             };
         }
+
+        let (obs_l, obs_conn) = mean_weighted_path_length(n, active_idxs, undir_edges);
 
         let mut rng = seed.max(1);
         let mut next_u64 = || -> u64 {
@@ -345,6 +392,9 @@ impl ConnectomeAtlas {
         let n_surr = 10_usize;
         let swaps = undir_edges.len() * 4;
         let mut sum_c0 = 0.0_f64;
+        let mut sum_l0_conn = 0.0_f64;
+        let mut cnt_l0_conn = 0_usize;
+        let mut sum_l0_all = 0.0_f64;
         let mut sum_rc0 = 0.0_f64;
         let mut sum_cost0 = 0.0_f64;
 
@@ -417,13 +467,27 @@ impl ConnectomeAtlas {
                 }
                 sum_rc0 += (2 * internal) as f64 / ((hubs.len() * (hubs.len() - 1)) as f64);
             }
+
+            let (l0, l0_conn) = mean_weighted_path_length(n, active_idxs, &elist);
+            sum_l0_all += l0;
+            if l0_conn {
+                sum_l0_conn += l0;
+                cnt_l0_conn += 1;
+            }
         }
 
-        let mean_c0 = (sum_c0 / (n_surr as f64)).max(0.02);
+        let mean_c0 = (sum_c0 / (n_surr as f64)).max(1e-4);
+        let mean_l0 = if obs_conn && cnt_l0_conn > 0 {
+            sum_l0_conn / (cnt_l0_conn as f64)
+        } else {
+            sum_l0_all / (n_surr as f64)
+        }
+        .max(1e-6);
         let mean_rc0 = (sum_rc0 / (n_surr as f64)).max(0.05);
         let mean_cost0 = (sum_cost0 / (n_surr as f64)).max(1.0);
 
-        let small_world_sigma = (obs_clust.max(0.05) / mean_c0) / 1.08;
+        let l_ratio = (obs_l.max(1e-6) / mean_l0).max(1e-6);
+        let small_world_sigma = (obs_clust / mean_c0) / l_ratio;
         let rich_club_normalized = if obs_rc > 0.0 { obs_rc / mean_rc0 } else { 1.0 };
         let wiring_cost_saving_pct = ((obs_cost - mean_cost0) / mean_cost0) * 100.0;
 
@@ -488,6 +552,9 @@ impl ConnectomeAtlas {
             generative_eta_distance: best_eta,
             generative_gamma_homophily: best_gamma,
             generative_discrepancy: (best_err * 0.55).clamp(0.06, 0.42),
+            obs_characteristic_path_length: obs_l,
+            null_characteristic_path_length: mean_l0,
+            null_clustering_coeff: mean_c0,
         }
     }
 
@@ -589,9 +656,23 @@ mod tests {
     fn computes_synergy_economy_transcriptomics_and_null_models() {
         let mut human = load_preset_by_id("human_mni152").expect("human preset");
         let rep = human.compute_systems_neuro_report(0.0, 42);
+        let sum = human.compute_summary_metrics(0.0);
         assert_eq!(rep.node_profiles.len(), human.regions.len());
         assert!(rep.total_wiring_cost_mm > 100.0);
         assert!(rep.null_benchmark.small_world_sigma > 0.5);
+        assert!(rep.null_benchmark.obs_characteristic_path_length > 0.0);
+        assert!(rep.null_benchmark.null_characteristic_path_length > 0.0);
+        assert!(rep.null_benchmark.null_clustering_coeff > 0.0);
+
+        let expected_sigma = (sum.mean_clustering / rep.null_benchmark.null_clustering_coeff)
+            / (rep.null_benchmark.obs_characteristic_path_length
+                / rep.null_benchmark.null_characteristic_path_length);
+        assert!(
+            (rep.null_benchmark.small_world_sigma - expected_sigma).abs() < 1e-9,
+            "small_world_sigma must equal (C/C0)/(L/L0): {} vs {}",
+            rep.null_benchmark.small_world_sigma,
+            expected_sigma
+        );
         assert!(rep.transcriptomic_g1_pearson_r >= 0.0 && rep.transcriptomic_g1_pearson_r <= 1.0);
 
         human.toggle_region_ablation("LANG.Broca_L");

@@ -15,20 +15,23 @@
 
 use atlas_core::{
     all_presets, build_command_index, search_command_index, AtlasEnvelope, AtlasSummaryMetrics,
-    CommandAction, CommandEntry, ConnectomeAtlas, ControlHarmonicsReport, CriticalityReport, DecColor, DomainDecodeEntry, PathResult, SystemsNeuroReport, TopologyTdaReport,
+    CommandAction, CommandEntry, ConnectomeAtlas, ControlHarmonicsReport, CriticalityReport,
+    DecColor, DomainDecodeEntry, LesionDeltaReport, PathResult, SystemsNeuroReport,
+    TopologyTdaReport,
 };
 use atlas_io::{parse_nifti1_header, parse_swc_morphology, parse_trk_streamlines, AtlasVault};
 use atlas_io::{format_swc_document, generate_region_swc_arbor};
 use atlas_render::{
     build_species_anatomy, compute_atlas_fiber_tensors, generate_2d_slice_contours,
-    generate_arched_tract_curve, generate_braided_fascicle_bundle, is_point_clipped_by_cutaway,
-    AnatomicalLayer, ColorSchemeMode, FlyThroughController, LocalFiberTensor, OrbitCamera,
-    SpeciesAnatomyScene, SurgicalCutawayMode, TractRenderStyle, ViewPreset,
+    generate_arched_tract_curve, generate_braided_fascicle_bundle, generate_tensor_ellipsoid_mesh,
+    is_point_clipped_by_cutaway, AnatomicalLayer, ColorSchemeMode, FlyThroughController,
+    LocalFiberTensor, OrbitCamera, SpeciesAnatomyScene, SurgicalCutawayMode, TractRenderStyle,
+    ViewPreset,
 };
 use eframe::egui::epaint::{Mesh as EguiMesh, Vertex as EguiVertex, WHITE_UV};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use glam::Vec3;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeMode {
@@ -42,6 +45,7 @@ enum RightTab {
     Inspector,
     AdjacencyMatrix,
     RichClubHubs,
+    CriticalityTda,
     VaultIo,
 }
 
@@ -50,6 +54,7 @@ pub struct ConnectomeAtlasApp {
     active_preset_idx: usize,
     atlas: ConnectomeAtlas,
     metrics: AtlasSummaryMetrics,
+    lesion_delta: LesionDeltaReport,
     control_harmonics: ControlHarmonicsReport,
     systems_neuro: SystemsNeuroReport,
     criticality_kappa: f64,
@@ -93,7 +98,9 @@ pub struct ConnectomeAtlasApp {
     cmd_palette_open: bool,
     show_about_window: bool,
     cmd_query: String,
+    cmd_selected_idx: usize,
     cmd_entries: Vec<CommandEntry>,
+    pending_scope_open: Option<String>,
     slot_name_buf: String,
     status_msg: String,
 }
@@ -118,8 +125,48 @@ impl ConnectomeAtlasApp {
         let active_preset_idx = initial_preset
             .and_then(|pid| presets.iter().position(|p| p.id == pid))
             .unwrap_or(0);
+        let vault = AtlasVault::open(db_path).ok();
+        Self::init_from_preset(
+            presets,
+            active_preset_idx,
+            vault,
+            0.28,
+            0.0,
+            "Ready - Press Ctrl+K to search, F1 for shortcuts, or drop files onto viewport.",
+        )
+    }
+
+    pub fn new_headless(preset_idx: usize) -> Self {
+        let presets = all_presets();
+        let idx = preset_idx.min(presets.len().saturating_sub(1));
+        let vault = AtlasVault::open_in_memory().ok();
+        Self::init_from_preset(
+            presets,
+            idx,
+            vault,
+            0.0,
+            0.15,
+            "Headless ConnectomeAtlas snapshot ready.",
+        )
+    }
+
+    fn init_from_preset(
+        presets: Vec<ConnectomeAtlas>,
+        active_preset_idx: usize,
+        vault: Option<AtlasVault>,
+        flow_speed: f32,
+        tonic_phase: f32,
+        status_msg: &str,
+    ) -> Self {
         let atlas = presets[active_preset_idx].clone();
         let metrics = atlas.compute_summary_metrics(0.0);
+        let lesion_delta = LesionDeltaReport {
+            intact_efficiency: metrics.global_efficiency,
+            lesioned_efficiency: metrics.global_efficiency,
+            efficiency_retention_pct: 100.0,
+            intact_components: metrics.connected_components,
+            lesioned_components: metrics.connected_components,
+        };
         let control_harmonics = atlas.compute_control_and_harmonics(0.0, "ht", 0.0);
         let systems_neuro = atlas.compute_systems_neuro_report(0.0, 1337);
         let criticality = atlas.compute_criticality_report(0.0, 1.0);
@@ -144,21 +191,20 @@ impl ConnectomeAtlasApp {
             _ => None,
         };
         let cmd_entries = build_command_index(&atlas);
-        let vault = AtlasVault::open(db_path).ok();
-        let camera = OrbitCamera {
-            yaw_rad: anatomy_scene.default_yaw,
-            pitch_rad: anatomy_scene.default_pitch,
-            distance: anatomy_scene.default_distance,
-            target: Vec3::from_array(anatomy_scene.default_target),
-            ..OrbitCamera::default()
-        };
+        let mut camera = OrbitCamera::default();
+        camera.yaw_rad = anatomy_scene.default_yaw;
+        camera.pitch_rad = anatomy_scene.default_pitch;
+        camera.distance = anatomy_scene.default_distance;
+        camera.target = Vec3::from_array(anatomy_scene.default_target);
         let default_slice = anatomy_scene.default_slice;
+        let vel = atlas.conduction_velocity_m_s as f32;
 
         Self {
             presets,
             active_preset_idx,
             atlas,
             metrics,
+            lesion_delta,
             control_harmonics,
             systems_neuro,
             criticality_kappa: 1.0,
@@ -183,9 +229,9 @@ impl ConnectomeAtlasApp {
             right_tab: RightTab::Inspector,
             min_weight: 0.0,
             shell_opacity: 0.45,
-            flow_speed: 0.28,
-            tonic_phase: 0.0,
-            conduction_velocity_m_s: 9.6,
+            flow_speed,
+            tonic_phase,
+            conduction_velocity_m_s: vel,
             show_slice_planes: true,
             slice_x_mm: default_slice[0],
             slice_y_mm: default_slice[1],
@@ -202,114 +248,45 @@ impl ConnectomeAtlasApp {
             cmd_palette_open: false,
             show_about_window: false,
             cmd_query: String::new(),
+            cmd_selected_idx: 0,
             cmd_entries,
+            pending_scope_open: None,
             slot_name_buf: "session_snapshot_01".to_string(),
-            status_msg: "Ready - Press Ctrl+K to search regions/actions, Z for Zen 3D, or drop files onto viewport."
-                .to_string(),
-        }
-    }
-
-    pub fn new_headless(preset_idx: usize) -> Self {
-        let presets = all_presets();
-        let idx = preset_idx.min(presets.len().saturating_sub(1));
-        let atlas = presets[idx].clone();
-        let metrics = atlas.compute_summary_metrics(0.0);
-        let control_harmonics = atlas.compute_control_and_harmonics(0.0, "ht", 0.0);
-        let systems_neuro = atlas.compute_systems_neuro_report(0.0, 1337);
-        let criticality = atlas.compute_criticality_report(0.0, 1.0);
-        let topology_tda = atlas.compute_topology_tda_report(0.0);
-        let domain_decode = atlas.decode_functional_domains(None, 0.0);
-        let fiber_tensors = compute_atlas_fiber_tensors(&atlas, 0.0);
-        let anatomy_scene = build_species_anatomy(&atlas.id);
-        let selected_region = atlas.regions.first().map(|r| r.id.clone());
-        let (path_source, path_target) = if idx == 0 {
-            (
-                Some("LANG.Wernicke_L".to_string()),
-                Some("LANG.Broca_L".to_string()),
-            )
-        } else {
-            (
-                atlas.regions.first().map(|r| r.id.clone()),
-                atlas.regions.last().map(|r| r.id.clone()),
-            )
-        };
-        let active_path = match (&path_source, &path_target) {
-            (Some(s), Some(t)) => atlas.shortest_signaling_path(s, t, 0.0),
-            _ => None,
-        };
-        let cmd_entries = build_command_index(&atlas);
-        let vault = AtlasVault::open_in_memory().ok();
-        let camera = OrbitCamera {
-            yaw_rad: anatomy_scene.default_yaw,
-            pitch_rad: anatomy_scene.default_pitch,
-            distance: anatomy_scene.default_distance,
-            target: Vec3::from_array(anatomy_scene.default_target),
-            ..OrbitCamera::default()
-        };
-        let default_slice = anatomy_scene.default_slice;
-
-        Self {
-            presets,
-            active_preset_idx: idx,
-            atlas,
-            metrics,
-            control_harmonics,
-            systems_neuro,
-            criticality_kappa: 1.0,
-            criticality,
-            topology_tda,
-            domain_decode,
-            fiber_tensors,
-            anatomy_scene,
-            tract_style: TractRenderStyle::BraidedFascicles,
-            cutaway_mode: SurgicalCutawayMode::AnteriorSuperiorOctant,
-            cutaway_offset_mm: 0.0,
-            show_tensor_glyphs: true,
-            show_internal_organs: true,
-            show_anatomical_labels: true,
-            fly_ctrl: FlyThroughController::default(),
-            receptor_channel: "ht".to_string(),
-            agonist_gain: 0.0,
-            harmonic_mode_idx: 1,
-            camera,
-            color_mode: ColorSchemeMode::FunctionalNetwork,
-            probe_mode: ProbeMode::Inspect,
-            right_tab: RightTab::Inspector,
-            min_weight: 0.0,
-            shell_opacity: 0.45,
-            flow_speed: 0.0,
-            tonic_phase: 0.15,
-            conduction_velocity_m_s: 9.6,
-            show_slice_planes: true,
-            slice_x_mm: default_slice[0],
-            slice_y_mm: default_slice[1],
-            slice_z_mm: default_slice[2],
-            selected_region,
-            path_source,
-            path_target,
-            active_path,
-            vault,
-            show_left_panel: true,
-            show_right_panel: true,
-            show_bottom_slices: true,
-            zen_mode: false,
-            cmd_palette_open: false,
-            show_about_window: false,
-            cmd_query: String::new(),
-            cmd_entries,
-            slot_name_buf: "session_snapshot_01".to_string(),
-            status_msg: "Headless ConnectomeAtlas snapshot ready.".to_string(),
+            status_msg: status_msg.to_string(),
         }
     }
 
     fn recompute(&mut self) {
+        self.atlas.conduction_velocity_m_s = self.conduction_velocity_m_s as f64;
         self.metrics = self.atlas.compute_summary_metrics(self.min_weight);
-        self.control_harmonics = self.atlas.compute_control_and_harmonics(self.min_weight, &self.receptor_channel, self.agonist_gain);
+        self.lesion_delta =
+            if self.atlas.ablated_regions.is_empty() && self.atlas.severed_tracts.is_empty() {
+                LesionDeltaReport {
+                    intact_efficiency: self.metrics.global_efficiency,
+                    lesioned_efficiency: self.metrics.global_efficiency,
+                    efficiency_retention_pct: 100.0,
+                    intact_components: self.metrics.connected_components,
+                    lesioned_components: self.metrics.connected_components,
+                }
+            } else {
+                self.atlas.evaluate_lesion_impact(self.min_weight)
+            };
+        self.control_harmonics = self.atlas.compute_control_and_harmonics(
+            self.min_weight,
+            &self.receptor_channel,
+            self.agonist_gain,
+        );
+        let max_h = self.control_harmonics.harmonic_modes.len().max(1);
+        self.harmonic_mode_idx = self.harmonic_mode_idx.clamp(1, max_h);
         self.fiber_tensors = compute_atlas_fiber_tensors(&self.atlas, self.min_weight);
         self.systems_neuro = self.atlas.compute_systems_neuro_report(self.min_weight, 1337);
-        self.criticality = self.atlas.compute_criticality_report(self.min_weight, self.criticality_kappa);
+        self.criticality = self
+            .atlas
+            .compute_criticality_report(self.min_weight, self.criticality_kappa);
         self.topology_tda = self.atlas.compute_topology_tda_report(self.min_weight);
-        self.domain_decode = self.atlas.decode_functional_domains(self.selected_region.as_deref(), self.min_weight);
+        self.domain_decode = self
+            .atlas
+            .decode_functional_domains(self.selected_region.as_deref(), self.min_weight);
         self.cmd_entries = build_command_index(&self.atlas);
         if let (Some(s), Some(t)) = (&self.path_source, &self.path_target) {
             self.active_path = self.atlas.shortest_signaling_path(s, t, self.min_weight);
@@ -318,7 +295,69 @@ impl ConnectomeAtlasApp {
         }
     }
 
+    fn set_view_preset(&mut self, preset: ViewPreset, smooth: bool) {
+        self.fly_ctrl.active = false;
+        if smooth {
+            self.camera.start_preset_transition(preset);
+        } else {
+            self.camera.apply_preset(preset);
+        }
+        let label = match preset {
+            ViewPreset::Perspective3D => "3D Orbit (1)",
+            ViewPreset::LeftSagittal => "Left Sagittal (2)",
+            ViewPreset::SuperiorAxial => "Superior Axial (3)",
+            ViewPreset::AnteriorCoronal => "Anterior Coronal (4)",
+        };
+        self.status_msg = format!("Camera preset: {label}");
+    }
+
+    fn reset_camera_to_species(&mut self, smooth: bool) {
+        self.fly_ctrl.active = false;
+        let target = Vec3::from_array(self.anatomy_scene.default_target);
+        if smooth {
+            self.camera.start_transition(
+                self.anatomy_scene.default_yaw,
+                self.anatomy_scene.default_pitch,
+                Some(self.anatomy_scene.default_distance),
+                Some(target),
+            );
+        } else {
+            self.camera.cancel_transition();
+            self.camera.yaw_rad = self.anatomy_scene.default_yaw;
+            self.camera.pitch_rad = self.anatomy_scene.default_pitch;
+            self.camera.distance = self.anatomy_scene.default_distance;
+            self.camera.target = target;
+        }
+        self.status_msg = format!("Reset camera to {} default view (R).", self.atlas.organism);
+    }
+
+    fn cycle_cutaway(&mut self) {
+        self.cutaway_mode = match self.cutaway_mode {
+            SurgicalCutawayMode::Intact => SurgicalCutawayMode::AnteriorSuperiorOctant,
+            SurgicalCutawayMode::AnteriorSuperiorOctant => SurgicalCutawayMode::LeftHemisphere,
+            SurgicalCutawayMode::LeftHemisphere => SurgicalCutawayMode::SuperiorAxialDome,
+            SurgicalCutawayMode::SuperiorAxialDome => SurgicalCutawayMode::Intact,
+        };
+        let label = match self.cutaway_mode {
+            SurgicalCutawayMode::Intact => "Intact Shell",
+            SurgicalCutawayMode::AnteriorSuperiorOctant => "Anterior-Superior Octant",
+            SurgicalCutawayMode::LeftHemisphere => "Left Hemisphere Window",
+            SurgicalCutawayMode::SuperiorAxialDome => "Superior Axial Dome",
+        };
+        self.status_msg = format!("Surgical cutaway: {label} (C).");
+    }
+
+    fn toggle_zen_mode(&mut self) {
+        self.zen_mode = !self.zen_mode;
+        let vis = !self.zen_mode;
+        self.show_left_panel = vis;
+        self.show_right_panel = vis;
+        self.show_bottom_slices = vis;
+    }
+
     fn apply_species_framing(&mut self) {
+        self.fly_ctrl.active = false;
+        self.camera.cancel_transition();
         self.anatomy_scene = build_species_anatomy(&self.atlas.id);
         self.camera.target = Vec3::from_array(self.anatomy_scene.default_target);
         self.camera.distance = self.anatomy_scene.default_distance;
@@ -332,9 +371,15 @@ impl ConnectomeAtlasApp {
     fn switch_preset(&mut self, idx: usize) {
         self.active_preset_idx = idx;
         self.atlas = self.presets[idx].clone();
+        self.conduction_velocity_m_s = self.atlas.conduction_velocity_m_s as f32;
         self.selected_region = self.atlas.regions.first().map(|r| r.id.clone());
-        self.path_source = self.atlas.regions.first().map(|r| r.id.clone());
-        self.path_target = self.atlas.regions.last().map(|r| r.id.clone());
+        if idx == 0 {
+            self.path_source = Some("LANG.Wernicke_L".to_string());
+            self.path_target = Some("LANG.Broca_L".to_string());
+        } else {
+            self.path_source = self.atlas.regions.first().map(|r| r.id.clone());
+            self.path_target = self.atlas.regions.last().map(|r| r.id.clone());
+        }
         self.apply_species_framing();
         self.recompute();
     }
@@ -361,7 +406,10 @@ impl ConnectomeAtlasApp {
                 }) {
                 Ok(env) => {
                     self.atlas = env.atlas;
+                    self.conduction_velocity_m_s = self.atlas.conduction_velocity_m_s as f32;
                     self.selected_region = self.atlas.regions.first().map(|r| r.id.clone());
+                    self.path_source = self.atlas.regions.first().map(|r| r.id.clone());
+                    self.path_target = self.atlas.regions.last().map(|r| r.id.clone());
                     self.apply_species_framing();
                     self.recompute();
                     self.status_msg = format!("Loaded envelope {}", path.display());
@@ -473,17 +521,110 @@ impl ConnectomeAtlasApp {
         }
     }
 
+    fn execute_command_action(&mut self, act: CommandAction, animate: bool) {
+        match act {
+            CommandAction::JumpToRegion(rid) => {
+                self.select_region(rid.clone(), true);
+                if let Some(reg) = self.atlas.regions.iter().find(|r| r.id == rid) {
+                    let focus = Vec3::from_array(reg.coord);
+                    self.fly_ctrl.active = false;
+                    if animate {
+                        self.camera.start_transition(
+                            self.camera.yaw_rad,
+                            self.camera.pitch_rad,
+                            None,
+                            Some(focus),
+                        );
+                    } else {
+                        self.camera.target = focus;
+                    }
+                }
+                self.status_msg = format!("Jumped to {rid}.");
+            }
+            CommandAction::SwitchPreset(pid) => {
+                if let Some(idx) = self.presets.iter().position(|p| p.id == pid) {
+                    self.switch_preset(idx);
+                    self.status_msg = format!("Switched preset to {}.", self.atlas.organism);
+                }
+            }
+            CommandAction::ToggleZenMode => {
+                self.toggle_zen_mode();
+            }
+            CommandAction::SetControlScope(scope) => {
+                self.zen_mode = false;
+                self.show_left_panel = true;
+                self.pending_scope_open = Some(scope.clone());
+                self.status_msg = format!("Focused control scope: {scope}.");
+            }
+            CommandAction::SetCutaway(m) => {
+                self.cutaway_mode = match m.as_str() {
+                    "octant" => SurgicalCutawayMode::AnteriorSuperiorOctant,
+                    "left_hemi" => SurgicalCutawayMode::LeftHemisphere,
+                    "axial_dome" => SurgicalCutawayMode::SuperiorAxialDome,
+                    _ => SurgicalCutawayMode::Intact,
+                };
+                self.status_msg = format!("Set surgical cutaway mode: {m}.");
+            }
+            CommandAction::ToggleFlyThrough => {
+                self.fly_ctrl.active = !self.fly_ctrl.active;
+                self.fly_ctrl.progress_u = 0.0;
+                if self.fly_ctrl.active {
+                    self.camera.cancel_transition();
+                }
+            }
+            CommandAction::HealAllLesions => {
+                self.atlas.heal_all();
+                self.recompute();
+                self.status_msg = "Restored all ablated regions and severed tracts.".to_string();
+            }
+            CommandAction::ExportEnvelopeJson => {
+                self.export_envelope_dialog();
+            }
+            CommandAction::ExportSelectedSwc => {
+                self.export_swc_dialog();
+            }
+            CommandAction::TuneCriticalityKappa(k_pct) => {
+                self.criticality_kappa = (k_pct as f64 / 100.0).clamp(0.35, 2.0);
+                self.recompute();
+                self.zen_mode = false;
+                self.show_right_panel = true;
+                self.right_tab = RightTab::CriticalityTda;
+                self.color_mode = ColorSchemeMode::CriticalitySusceptibility;
+                self.status_msg = format!(
+                    "Tuned criticality kappa = {:.2} (sigma = {:.3}).",
+                    self.criticality_kappa, self.criticality.branching_ratio_sigma
+                );
+            }
+            CommandAction::InspectPersistentCavities => {
+                self.zen_mode = false;
+                self.show_right_panel = true;
+                self.right_tab = RightTab::CriticalityTda;
+                self.color_mode = ColorSchemeMode::TdaBeta1Loops;
+                self.status_msg = format!(
+                    "Inspecting {} persistent beta-1 topological cavities.",
+                    self.topology_tda.persistent_beta1_count
+                );
+            }
+        }
+    }
+
     pub fn ui_step(&mut self, ctx: &egui::Context, animate: bool) {
         let dt = ctx.input(|i| i.stable_dt).min(0.05);
-        if animate && (self.flow_speed > 0.001 || self.fly_ctrl.active) {
-            self.tonic_phase = (self.tonic_phase + dt * self.flow_speed) % 1.0;
-            if self.fly_ctrl.active {
-                self.fly_ctrl.progress_u = (self.fly_ctrl.progress_u + dt * self.fly_ctrl.speed) % 1.0;
+        if animate {
+            let cam_anim = self.camera.step_transition(dt);
+            if self.flow_speed > 0.001 || self.fly_ctrl.active || cam_anim {
+                if self.flow_speed > 0.001 || self.fly_ctrl.active {
+                    self.tonic_phase = (self.tonic_phase + dt * self.flow_speed) % 1.0;
+                }
+                if self.fly_ctrl.active {
+                    self.fly_ctrl.progress_u =
+                        (self.fly_ctrl.progress_u + dt * self.fly_ctrl.speed) % 1.0;
+                }
+                ctx.request_repaint();
             }
-            ctx.request_repaint();
         }
 
-        // Global Keyboard Shortcuts (Escape, F1, Ctrl/Cmd+K/O/S, Z Zen Full-Canvas)
+        // Global Keyboard Shortcuts (Escape, F1, Ctrl/Cmd+K/O/S)
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.cmd_palette_open {
                 self.cmd_palette_open = false;
@@ -504,6 +645,7 @@ impl ConnectomeAtlasApp {
         if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::K)) {
             self.cmd_palette_open = !self.cmd_palette_open;
             self.cmd_query.clear();
+            self.cmd_selected_idx = 0;
         }
         if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::O)) {
             self.open_dataset_dialog();
@@ -511,12 +653,35 @@ impl ConnectomeAtlasApp {
         if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::S)) {
             self.export_envelope_dialog();
         }
-        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Z)) {
-            self.zen_mode = !self.zen_mode;
-            let vis = !self.zen_mode;
-            self.show_left_panel = vis;
-            self.show_right_panel = vis;
-            self.show_bottom_slices = vis;
+
+        // Viewport Hotkeys guarded against active text inputs & modifier chords
+        let plain_key_allowed = !ctx.wants_keyboard_input()
+            && ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.command && !i.modifiers.alt);
+        if plain_key_allowed {
+            if ctx.input(|i| i.key_pressed(egui::Key::Z)) {
+                self.toggle_zen_mode();
+            } else if ctx.input(|i| i.key_pressed(egui::Key::Num1)) {
+                self.set_view_preset(ViewPreset::Perspective3D, animate);
+            } else if ctx.input(|i| i.key_pressed(egui::Key::Num2)) {
+                self.set_view_preset(ViewPreset::LeftSagittal, animate);
+            } else if ctx.input(|i| i.key_pressed(egui::Key::Num3)) {
+                self.set_view_preset(ViewPreset::SuperiorAxial, animate);
+            } else if ctx.input(|i| i.key_pressed(egui::Key::Num4)) {
+                self.set_view_preset(ViewPreset::AnteriorCoronal, animate);
+            } else if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+                self.reset_camera_to_species(animate);
+            } else if ctx.input(|i| i.key_pressed(egui::Key::I)) {
+                self.probe_mode = ProbeMode::Inspect;
+                self.status_msg = "Probe mode: Inspect Region (I).".to_string();
+            } else if ctx.input(|i| i.key_pressed(egui::Key::P)) {
+                self.probe_mode = ProbeMode::ShortestPath;
+                self.status_msg = "Probe mode: Shortest Signaling Path (P).".to_string();
+            } else if ctx.input(|i| i.key_pressed(egui::Key::L)) {
+                self.probe_mode = ProbeMode::LesionAblate;
+                self.status_msg = "Probe mode: Virtual Lesion / Ablate (L).".to_string();
+            } else if ctx.input(|i| i.key_pressed(egui::Key::C)) {
+                self.cycle_cutaway();
+            }
         }
 
         // Drag-and-Drop File Ingestion onto Window (.connectome.json, .swc, .trk, .nii)
@@ -542,9 +707,12 @@ impl ConnectomeAtlasApp {
                     self.switch_preset(target_idx);
                 }
                 ui.separator();
-                ui.selectable_value(&mut self.probe_mode, ProbeMode::Inspect, "Inspect");
-                ui.selectable_value(&mut self.probe_mode, ProbeMode::ShortestPath, "Signaling Path");
-                ui.selectable_value(&mut self.probe_mode, ProbeMode::LesionAblate, "Lesion / Ablate");
+                ui.selectable_value(&mut self.probe_mode, ProbeMode::Inspect, "Inspect")
+                    .on_hover_text("Inspect node properties, receptors, and functional role (Hotkey: I)");
+                ui.selectable_value(&mut self.probe_mode, ProbeMode::ShortestPath, "Signaling Path")
+                    .on_hover_text("Click source then target node to compute Dijkstra path (Hotkey: P)");
+                ui.selectable_value(&mut self.probe_mode, ProbeMode::LesionAblate, "Lesion / Ablate")
+                    .on_hover_text("Click region to simulate focal ablation and recalculate efficiency (Hotkey: L)");
                 if (!self.atlas.ablated_regions.is_empty() || !self.atlas.severed_tracts.is_empty())
                     && ui.button("Heal All").clicked()
                 {
@@ -555,22 +723,20 @@ impl ConnectomeAtlasApp {
                 ui.separator();
                 if ui.button("Jump / Search (Ctrl+K)").clicked() {
                     self.cmd_palette_open = !self.cmd_palette_open;
+                    self.cmd_query.clear();
+                    self.cmd_selected_idx = 0;
                 }
                 ui.toggle_value(&mut self.show_left_panel, "Controls");
                 ui.toggle_value(&mut self.show_bottom_slices, "2D Slices");
                 ui.toggle_value(&mut self.show_right_panel, "Analytics");
                 if ui.selectable_label(self.zen_mode, "Zen 3D").clicked() {
-                    self.zen_mode = !self.zen_mode;
-                    let vis = !self.zen_mode;
-                    self.show_left_panel = vis;
-                    self.show_right_panel = vis;
-                    self.show_bottom_slices = vis;
+                    self.toggle_zen_mode();
                 }
             });
         });
 
         egui::TopBottomPanel::bottom("status_footer").show(ctx, |ui| {
-            let delta = self.atlas.evaluate_lesion_impact(self.min_weight);
+            let delta = &self.lesion_delta;
             ui.horizontal_wrapped(|ui| {
                 ui.label(&self.status_msg);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -586,7 +752,7 @@ impl ConnectomeAtlasApp {
             ui.horizontal_wrapped(|ui| {
                 ui.small("Copyright CRV Science Network  |  GPL-3.0-or-later  |  ConnectomeAtlas v0.8.0");
                 ui.separator();
-                if ui.small_button("About ConnectomeAtlas").clicked() {
+                if ui.small_button("Shortcuts & About (F1)").clicked() {
                     self.show_about_window = true;
                 }
                 ui.hyperlink_to("crvscience.com", "https://crvscience.com");
@@ -594,6 +760,7 @@ impl ConnectomeAtlasApp {
         });
 
         if self.show_left_panel {
+            let scope_override = self.pending_scope_open.take();
             egui::SidePanel::left("left_controls")
                 .default_width(295.0)
                 .show(ctx, |ui| {
@@ -603,39 +770,61 @@ impl ConnectomeAtlasApp {
 
                         egui::CollapsingHeader::new("1. Camera & Palette")
                             .default_open(true)
+                            .open(scope_override.as_deref().map(|s| s == "explore"))
                             .show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
-                                    if ui.button("3D Orbit").clicked() {
-                                        self.camera.apply_preset(ViewPreset::Perspective3D);
+                                    if ui.button("3D Orbit").on_hover_text("Smooth 3D perspective camera (Hotkey: 1)").clicked() {
+                                        self.set_view_preset(ViewPreset::Perspective3D, animate);
                                     }
-                                    if ui.button("Sagittal").clicked() {
-                                        self.camera.apply_preset(ViewPreset::LeftSagittal);
+                                    if ui.button("Sagittal").on_hover_text("Left sagittal view (Hotkey: 2)").clicked() {
+                                        self.set_view_preset(ViewPreset::LeftSagittal, animate);
                                     }
-                                    if ui.button("Axial").clicked() {
-                                        self.camera.apply_preset(ViewPreset::SuperiorAxial);
+                                    if ui.button("Axial").on_hover_text("Superior axial top-down view (Hotkey: 3)").clicked() {
+                                        self.set_view_preset(ViewPreset::SuperiorAxial, animate);
                                     }
-                                    if ui.button("Coronal").clicked() {
-                                        self.fly_ctrl.active = false;
-                                        self.camera.apply_preset(ViewPreset::AnteriorCoronal);
+                                    if ui.button("Coronal").on_hover_text("Anterior coronal view (Hotkey: 4)").clicked() {
+                                        self.set_view_preset(ViewPreset::AnteriorCoronal, animate);
+                                    }
+                                    if ui.button("Reset").on_hover_text("Reset camera to species default framing (Hotkey: R)").clicked() {
+                                        self.reset_camera_to_species(animate);
                                     }
                                     let fly_lbl = if self.fly_ctrl.active { "Stop Flight" } else { "Fly Path" };
-                                    if ui.button(fly_lbl).clicked() {
+                                    if ui.button(fly_lbl).on_hover_text("Chase camera flying along the active signaling path").clicked() {
                                         self.fly_ctrl.active = !self.fly_ctrl.active;
                                         self.fly_ctrl.progress_u = 0.0;
+                                        if self.fly_ctrl.active {
+                                            self.camera.cancel_transition();
+                                        }
                                     }
                                 });
-                                ui.radio_value(&mut self.color_mode, ColorSchemeMode::FunctionalNetwork, "Functional Network");
-                                ui.radio_value(&mut self.color_mode, ColorSchemeMode::DtiDirectionalRgb, "DTI Directional RGB");
-                                ui.radio_value(&mut self.color_mode, ColorSchemeMode::BetweennessHeatmap, "Betweenness Heatmap");
-                                if ui.add(egui::Slider::new(&mut self.min_weight, 0.0..=0.92).text("Min Weight")).changed() {
+                                ui.radio_value(&mut self.color_mode, ColorSchemeMode::FunctionalNetwork, "Functional Network")
+                                    .on_hover_text("Color ROIs and tracts by intrinsic functional module");
+                                ui.radio_value(&mut self.color_mode, ColorSchemeMode::DtiDirectionalRgb, "DTI Directional RGB")
+                                    .on_hover_text("Color pathways by stereotaxic fiber orientation (R=L-R, G=A-P, B=S-I)");
+                                ui.radio_value(&mut self.color_mode, ColorSchemeMode::BetweennessHeatmap, "Betweenness Heatmap")
+                                    .on_hover_text("Highlight Brandes shortest-path hub bottlenecks");
+                                ui.radio_value(&mut self.color_mode, ColorSchemeMode::HarmonicModePsi, "Harmonic Mode psi_k")
+                                    .on_hover_text("Modulate 3D nodes & tracts by active Graph Laplacian eigenmode psi_k");
+                                ui.radio_value(&mut self.color_mode, ColorSchemeMode::CriticalitySusceptibility, "Criticality sigma_i")
+                                    .on_hover_text("Color nodes & pathways by Kinouchi-Copelli avalanche susceptibility");
+                                ui.radio_value(&mut self.color_mode, ColorSchemeMode::TdaBeta1Loops, "TDA beta-1 Loops")
+                                    .on_hover_text("Highlight persistent Z2 H1 topological loop cavities and participating hubs");
+
+                                if ui.add(egui::Slider::new(&mut self.min_weight, 0.0..=0.92).text("Min Weight"))
+                                    .on_hover_text("Prune pathways below minimum connection weight w_min and recompute topology/TDA")
+                                    .changed()
+                                {
                                     self.recompute();
                                 }
-                                ui.add(egui::Slider::new(&mut self.shell_opacity, 0.0..=0.85).text("Shell Alpha"));
-                                ui.add(egui::Slider::new(&mut self.flow_speed, 0.0..=1.0).text("River Flow"));
+                                ui.add(egui::Slider::new(&mut self.shell_opacity, 0.0..=0.85).text("Shell Alpha"))
+                                    .on_hover_text("Adjust translucent Fresnel glass brain/organism outer shell opacity");
+                                ui.add(egui::Slider::new(&mut self.flow_speed, 0.0..=1.0).text("River Flow"))
+                                    .on_hover_text("Adjust tonic laminar wave speed along pathways (0 pauses animation)");
                             });
 
                         egui::CollapsingHeader::new("2. 3D Shaders, Cutaway & Slices")
                             .default_open(false)
+                            .open(scope_override.as_deref().map(|s| s == "surgical"))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.selectable_value(&mut self.tract_style, TractRenderStyle::BraidedFascicles, "Braided Fascicles");
@@ -647,21 +836,26 @@ impl ConnectomeAtlasApp {
                                     ui.selectable_value(&mut self.cutaway_mode, SurgicalCutawayMode::LeftHemisphere, "L-Hemi");
                                     ui.selectable_value(&mut self.cutaway_mode, SurgicalCutawayMode::SuperiorAxialDome, "Dome");
                                 });
-                                ui.add(egui::Slider::new(&mut self.cutaway_offset_mm, -28.0..=28.0).text("Cutaway Offset"));
+                                ui.add(egui::Slider::new(&mut self.cutaway_offset_mm, -28.0..=28.0).text("Cutaway Offset"))
+                                    .on_hover_text("Shift the CSG surgical shell cutaway plane in stereotaxic mm (Hotkey C cycles modes)");
                                 ui.checkbox(&mut self.show_internal_organs, "3D Subcortical & Internal Anatomy");
                                 ui.checkbox(&mut self.show_anatomical_labels, "Anatomical Landmark Callouts");
-                                ui.checkbox(&mut self.show_tensor_glyphs, "3D Crossing-Fiber Tensor Glyphs");
+                                ui.checkbox(&mut self.show_tensor_glyphs, "3D Crossing-Fiber Tensor Ellipsoids");
                                 ui.checkbox(&mut self.show_slice_planes, "3D Stereotaxic Slice Grid");
                                 if self.show_slice_planes {
                                     let ext = self.anatomy_scene.slice_extent_mm.max(40.0);
-                                    ui.add(egui::Slider::new(&mut self.slice_x_mm, -ext..=ext).text("Sagittal X"));
-                                    ui.add(egui::Slider::new(&mut self.slice_y_mm, -ext..=ext).text("Coronal Y"));
-                                    ui.add(egui::Slider::new(&mut self.slice_z_mm, -ext..=ext).text("Axial Z"));
+                                    ui.add(egui::Slider::new(&mut self.slice_x_mm, -ext..=ext).text("Sagittal X"))
+                                        .on_hover_text("Move Sagittal YZ plane along Left-Right X axis (mm)");
+                                    ui.add(egui::Slider::new(&mut self.slice_y_mm, -ext..=ext).text("Coronal Y"))
+                                        .on_hover_text("Move Coronal XZ plane along Posterior-Anterior Y axis (mm)");
+                                    ui.add(egui::Slider::new(&mut self.slice_z_mm, -ext..=ext).text("Axial Z"))
+                                        .on_hover_text("Move Axial XY plane along Inferior-Superior Z axis (mm)");
                                 }
                             });
 
                         egui::CollapsingHeader::new("3. Receptors, Control & Harmonics")
                             .default_open(false)
+                            .open(scope_override.as_deref().map(|s| s == "dynamics"))
                             .show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
                                     for (code, label) in [
@@ -683,10 +877,16 @@ impl ConnectomeAtlasApp {
                                         }
                                     }
                                 });
-                                if ui.add(egui::Slider::new(&mut self.agonist_gain, -0.8..=2.0).text("Receptor Gain alpha")).changed() {
+                                if ui.add(egui::Slider::new(&mut self.agonist_gain, -0.8..=2.0).text("Receptor Gain alpha"))
+                                    .on_hover_text("Modulate regional control input gain B_i = max(0.15, 1 + alpha * rho_i)")
+                                    .changed()
+                                {
                                     self.recompute();
                                 }
-                                if ui.add(egui::Slider::new(&mut self.criticality_kappa, 0.40..=1.80).text("Criticality kappa")).changed() {
+                                if ui.add(egui::Slider::new(&mut self.criticality_kappa, 0.40..=1.80).text("Criticality kappa"))
+                                    .on_hover_text("Scale structural branching coupling kappa (sigma ~= 1.0 maximizes dynamic range)")
+                                    .changed()
+                                {
                                     self.recompute();
                                 }
                                 ui.label(format!(
@@ -696,8 +896,14 @@ impl ConnectomeAtlasApp {
                                     self.criticality.dynamic_range_db
                                 ));
                                 let max_h = self.control_harmonics.harmonic_modes.len().max(1);
-                                ui.add(egui::Slider::new(&mut self.harmonic_mode_idx, 1..=max_h).text("Harmonic psi_k"));
-                                ui.add(egui::Slider::new(&mut self.conduction_velocity_m_s, 3.0..=25.0).text("Velocity (m/s)"));
+                                ui.add(egui::Slider::new(&mut self.harmonic_mode_idx, 1..=max_h).text("Harmonic psi_k"))
+                                    .on_hover_text("Select normalized Graph Laplacian eigenmode psi_k for 3D Harmonic overlay");
+                                if ui.add(egui::Slider::new(&mut self.conduction_velocity_m_s, 3.0..=25.0).text("Velocity (m/s)"))
+                                    .on_hover_text("Set axonal conduction velocity v (m/s) used for signaling latency and nodal delays")
+                                    .changed()
+                                {
+                                    self.recompute();
+                                }
                                 ui.label(format!(
                                     "Ctrl Energy dE: {:+.1}% | omega_k: {:.3}",
                                     self.control_harmonics.energy_landscape_delta_pct,
@@ -707,6 +913,7 @@ impl ConnectomeAtlasApp {
 
                         egui::CollapsingHeader::new("4. Virtual Tractotomy Bundles")
                             .default_open(false)
+                            .open(scope_override.as_deref().map(|s| s == "surgical"))
                             .show(ui, |ui| {
                                 let tracts = self.atlas.unique_tracts();
                                 for tract in tracts {
@@ -723,12 +930,13 @@ impl ConnectomeAtlasApp {
 
         if self.show_right_panel {
             egui::SidePanel::right("right_analytics")
-                .default_width(365.0)
+                .default_width(375.0)
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.selectable_value(&mut self.right_tab, RightTab::Inspector, "Inspector");
                         ui.selectable_value(&mut self.right_tab, RightTab::AdjacencyMatrix, "Matrix");
                         ui.selectable_value(&mut self.right_tab, RightTab::RichClubHubs, "Hubs");
+                        ui.selectable_value(&mut self.right_tab, RightTab::CriticalityTda, "Crit / TDA");
                         ui.selectable_value(&mut self.right_tab, RightTab::VaultIo, "Vault / JSON");
                     });
                     ui.separator();
@@ -737,6 +945,7 @@ impl ConnectomeAtlasApp {
                         RightTab::Inspector => self.ui_inspector(ui),
                         RightTab::AdjacencyMatrix => self.ui_matrix(ui),
                         RightTab::RichClubHubs => self.ui_hubs(ui),
+                        RightTab::CriticalityTda => self.ui_criticality_tda(ui),
                         RightTab::VaultIo => self.ui_vault(ui),
                     });
                 });
@@ -757,19 +966,36 @@ impl ConnectomeAtlasApp {
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
-                .default_width(460.0)
+                .default_width(480.0)
                 .anchor(egui::Align2::CENTER_TOP, [0.0, 48.0])
                 .show(ctx, |ui| {
                     let resp = ui.text_edit_singleline(&mut self.cmd_query);
+                    if resp.changed() {
+                        self.cmd_selected_idx = 0;
+                    }
                     resp.request_focus();
-                    ui.separator();
                     let hits = search_command_index(&self.cmd_entries, &self.cmd_query, 18);
+                    if !hits.is_empty() {
+                        self.cmd_selected_idx = self.cmd_selected_idx.min(hits.len() - 1);
+                        if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                            self.cmd_selected_idx = (self.cmd_selected_idx + 1).min(hits.len() - 1);
+                        }
+                        if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                            self.cmd_selected_idx = self.cmd_selected_idx.saturating_sub(1);
+                        }
+                        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            chosen_action = Some(hits[self.cmd_selected_idx].action.clone());
+                        }
+                    } else {
+                        self.cmd_selected_idx = 0;
+                    }
+                    ui.small("Use Up/Down to select, Enter to execute, Esc to close.");
+                    ui.separator();
                     egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                        for entry in hits {
-                            if ui
-                                .button(format!("[{}] {} - {}", entry.category, entry.title, entry.subtitle))
-                                .clicked()
-                            {
+                        for (idx, entry) in hits.iter().enumerate() {
+                            let is_sel = idx == self.cmd_selected_idx;
+                            let lbl = format!("[{}] {} - {}", entry.category, entry.title, entry.subtitle);
+                            if ui.selectable_label(is_sel, lbl).clicked() {
                                 chosen_action = Some(entry.action.clone());
                             }
                         }
@@ -778,82 +1004,69 @@ impl ConnectomeAtlasApp {
             self.cmd_palette_open = open;
             if let Some(act) = chosen_action {
                 self.cmd_palette_open = false;
-                match act {
-                    CommandAction::JumpToRegion(rid) => {
-                        self.select_region(rid.clone(), true);
-                        self.status_msg = format!("Jumped to {rid}.");
-                    }
-                    CommandAction::SwitchPreset(pid) => {
-                        if let Some(idx) = self.presets.iter().position(|p| p.id == pid) {
-                            self.switch_preset(idx);
-                        }
-                    }
-                    CommandAction::ToggleZenMode => {
-                        self.zen_mode = !self.zen_mode;
-                        let vis = !self.zen_mode;
-                        self.show_left_panel = vis;
-                        self.show_right_panel = vis;
-                        self.show_bottom_slices = vis;
-                    }
-                    CommandAction::SetCutaway(m) => {
-                        self.cutaway_mode = match m.as_str() {
-                            "octant" => SurgicalCutawayMode::AnteriorSuperiorOctant,
-                            "left_hemi" => SurgicalCutawayMode::LeftHemisphere,
-                            "axial_dome" => SurgicalCutawayMode::SuperiorAxialDome,
-                            _ => SurgicalCutawayMode::Intact,
-                        };
-                    }
-                    CommandAction::ToggleFlyThrough => {
-                        self.fly_ctrl.active = !self.fly_ctrl.active;
-                        self.fly_ctrl.progress_u = 0.0;
-                    }
-                    CommandAction::HealAllLesions => {
-                        self.atlas.heal_all();
-                        self.recompute();
-                    }
-                    CommandAction::ExportEnvelopeJson => {
-                        self.export_envelope_dialog();
-                    }
-                    CommandAction::ExportSelectedSwc => {
-                        self.export_swc_dialog();
-                    }
-                    _ => {}
-                }
+                self.execute_command_action(act, animate);
             }
         }
 
         if self.show_about_window {
             let mut open = self.show_about_window;
-            egui::Window::new("About ConnectomeAtlas")
+            egui::Window::new("Shortcuts & About ConnectomeAtlas (F1)")
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
+                .default_width(500.0)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.heading("ConnectomeAtlas v0.8.0");
                     ui.label("Copyright CRV Science Network");
                     ui.label("License: GNU General Public License v3.0 or later (GPL-3.0-or-later)");
                     ui.separator();
-                    ui.label("Standalone 3D Brain & Multi-Scale Connectome Atlas workstation");
-                    ui.label("featuring Human MNI152, Mouse CCFv3, Drosophila FlyWire FAFB, and C. elegans WormAtlas,");
-                    ui.label("criticality dynamic-range analysis, persistent homology (beta-1), and SQLite WAL snapshots.");
+                    ui.label(egui::RichText::new("Interactive Controls & Keyboard Shortcuts").strong());
+                    egui::Grid::new("f1_shortcuts_grid")
+                        .striped(true)
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            let bindings = [
+                                ("Left-Drag", "Orbit 3D stereotaxic camera"),
+                                ("Right / Middle-Drag", "Pan 3D camera target"),
+                                ("Mouse Scroll", "Zoom camera distance (65-520 mm)"),
+                                ("Click Node (3D/2D/Matrix)", "Run active Probe Mode on region"),
+                                ("1 / 2 / 3 / 4", "3D Orbit / Sagittal / Axial / Coronal preset"),
+                                ("R", "Reset camera to species default framing"),
+                                ("I / P / L", "Probe Mode: Inspect / Path / Lesion"),
+                                ("C", "Cycle 3D surgical cutaway mode"),
+                                ("Z", "Toggle Zen Full-Canvas 3D mode"),
+                                ("Ctrl/Cmd + K", "Command palette (Up/Down, Enter to run)"),
+                                ("Ctrl/Cmd + O / S", "Open dataset / Export .connectome.json"),
+                                ("F1 / Esc", "Toggle help / Close overlays, flight, or Zen"),
+                            ];
+                            for (key, desc) in bindings {
+                                ui.strong(key);
+                                ui.label(desc);
+                                ui.end_row();
+                            }
+                        });
+                    ui.separator();
+                    ui.small("Standalone safe-Rust workstation featuring Human MNI152, Mouse CCFv3, Drosophila FlyWire FAFB, and C. elegans WormAtlas.");
                     ui.add_space(6.0);
-                    ui.hyperlink_to(
-                        "CRV Science Network Website (https://crvscience.com)",
-                        "https://crvscience.com",
-                    );
-                    ui.hyperlink_to(
-                        "CRV Science Public Apps (https://crvscience.com/apps)",
-                        "https://crvscience.com/apps",
-                    );
-                    ui.add_space(6.0);
-                    if ui.button("Close").clicked() {
-                        self.show_about_window = false;
-                    }
+                    ui.horizontal(|ui| {
+                        ui.hyperlink_to("CRV Science Network", "https://crvscience.com");
+                        ui.separator();
+                        ui.hyperlink_to("CRV Science Public Apps", "https://crvscience.com/apps");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Close").clicked() {
+                                self.show_about_window = false;
+                            }
+                        });
+                    });
                 });
             if !open {
                 self.show_about_window = false;
             }
+        }
+
+        if !animate {
+            self.camera.finish_transition();
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -887,8 +1100,11 @@ impl ConnectomeAtlasApp {
                 ui.label(egui::RichText::new("Shortest Signaling Pathway").strong());
                 ui.label(path.hops.join(" -> "));
                 ui.label(format!(
-                    "Hops: {} | Cost: {:.3} | Bottleneck W: {:.2}",
+                    "Hops: {} | Latency: {:.2} ms ({:.1} mm @ {:.1} m/s) | Cost: {:.3} | Bottleneck W: {:.2}",
                     path.hops.len().saturating_sub(1),
+                    path.conduction_latency_ms,
+                    path.arc_length_mm,
+                    self.conduction_velocity_m_s,
                     path.total_distance_cost,
                     path.bottleneck_weight
                 ));
@@ -952,7 +1168,7 @@ impl ConnectomeAtlasApp {
                         ));
                         ui.end_row();
                         ui.label("Communicability / Delay:");
-                        ui.label(format!("{:.3} / {:.1} ms", nm.communicability_centrality, nm.mean_conduction_delay_ms * (9.6 / self.conduction_velocity_m_s as f64)));
+                        ui.label(format!("{:.3} / {:.1} ms", nm.communicability_centrality, nm.mean_conduction_delay_ms));
                         ui.end_row();
                         ui.label("Receptors (DA/5HT/ACh/Glu/GABA):");
                         ui.label(format!(
@@ -1017,23 +1233,72 @@ impl ConnectomeAtlasApp {
 
     fn ui_matrix(&mut self, ui: &mut egui::Ui) {
         let n = self.atlas.regions.len();
-        ui.label(format!("Structural / Synaptic Connectivity Matrix ({n} x {n})"));
-        ui.label(egui::RichText::new(format!(
-            "TDA Cliques: {} 3-cliq, {} 4-cliq | Persistent beta-1 Cavities: {} (max pi={:.2})",
-            self.topology_tda.clique_3_total,
-            self.topology_tda.clique_4_total,
-            self.topology_tda.persistent_beta1_count,
-            self.topology_tda.max_persistence
-        )).small().color(Color32::from_rgb(34, 211, 238)));
-        let side = ui.available_width().min(330.0);
-        let (resp, painter) = ui.allocate_painter(Vec2::splat(side), Sense::click());
-        let rect = resp.rect;
-        painter.rect_filled(rect, 4.0, Color32::from_rgb(10, 14, 22));
+        ui.label(format!("Community-Ordered Connectivity Matrix ({n} x {n})"));
+        ui.label(
+            egui::RichText::new(format!(
+                "TDA Cliques: {} 3-cliq, {} 4-cliq | Persistent beta-1 Cavities: {} (max pi={:.2})",
+                self.topology_tda.clique_3_total,
+                self.topology_tda.clique_4_total,
+                self.topology_tda.persistent_beta1_count,
+                self.topology_tda.max_persistence
+            ))
+            .small()
+            .color(Color32::from_rgb(34, 211, 238)),
+        );
         if n == 0 {
             return;
         }
-        let cell = side / (n as f32);
-        let mut idx_map = HashMap::new();
+
+        // Group region indices contiguously by functional community network
+        let mut net_order: Vec<String> = Vec::new();
+        for r in &self.atlas.regions {
+            if !net_order.iter().any(|net| net == &r.network) {
+                net_order.push(r.network.clone());
+            }
+        }
+        let mut sorted_order: Vec<usize> = Vec::with_capacity(n);
+        struct CommBlock {
+            network: String,
+            start: usize,
+            end: usize,
+            rgb: [u8; 3],
+        }
+        let mut blocks: Vec<CommBlock> = Vec::with_capacity(net_order.len());
+        for net in &net_order {
+            let start = sorted_order.len();
+            let mut rgb = [56_u8, 189, 248];
+            for (idx, r) in self.atlas.regions.iter().enumerate() {
+                if &r.network == net {
+                    if sorted_order.len() == start {
+                        rgb = parse_hex_color(&r.color_hex);
+                    }
+                    sorted_order.push(idx);
+                }
+            }
+            let end = sorted_order.len();
+            if end > start {
+                blocks.push(CommBlock {
+                    network: net.clone(),
+                    start,
+                    end,
+                    rgb,
+                });
+            }
+        }
+
+        let side = ui.available_width().min(330.0);
+        let strip_px = 6.0_f32;
+        let mat_side = (side - strip_px).max(120.0);
+        let (resp, painter) = ui.allocate_painter(Vec2::splat(side), Sense::click());
+        let outer = resp.rect;
+        let rect = Rect::from_min_size(
+            Pos2::new(outer.left() + strip_px, outer.top() + strip_px),
+            Vec2::splat(mat_side),
+        );
+        painter.rect_filled(outer, 4.0, Color32::from_rgb(10, 14, 22));
+
+        let cell = mat_side / (n as f32);
+        let mut idx_map = HashMap::with_capacity(n);
         for (i, r) in self.atlas.regions.iter().enumerate() {
             idx_map.insert(r.id.as_str(), i);
         }
@@ -1044,23 +1309,71 @@ impl ConnectomeAtlasApp {
             }
             if let (Some(&i), Some(&j)) = (idx_map.get(e.source.as_str()), idx_map.get(e.target.as_str())) {
                 weights[i][j] = weights[i][j].max(e.weight);
-                let intensity = (e.weight.clamp(0.0, 1.0) * 235.0) as u8;
-                let col = Color32::from_rgb(30, intensity, 255);
-                let r1 = Rect::from_min_size(
-                    Pos2::new(rect.left() + (j as f32) * cell, rect.top() + (i as f32) * cell),
-                    Vec2::splat((cell - 0.5).max(1.5)),
-                );
-                painter.rect_filled(r1, 0.0, col);
                 if !e.directed {
                     weights[j][i] = weights[j][i].max(e.weight);
-                    let r2 = Rect::from_min_size(
-                        Pos2::new(rect.left() + (i as f32) * cell, rect.top() + (j as f32) * cell),
-                        Vec2::splat((cell - 0.5).max(1.5)),
-                    );
-                    painter.rect_filled(r2, 0.0, col);
                 }
             }
         }
+
+        // Draw sorted matrix cells with perceptual thermal-cyan ramp
+        for (row_pos, &src_idx) in sorted_order.iter().enumerate() {
+            for (col_pos, &dst_idx) in sorted_order.iter().enumerate() {
+                let w = weights[src_idx][dst_idx];
+                if w > 0.0 {
+                    let rgb = matrix_weight_rgb(w as f32);
+                    let cell_rect = Rect::from_min_size(
+                        Pos2::new(
+                            rect.left() + (col_pos as f32) * cell,
+                            rect.top() + (row_pos as f32) * cell,
+                        ),
+                        Vec2::splat((cell - 0.45).max(1.5)),
+                    );
+                    painter.rect_filled(
+                        cell_rect,
+                        0.0,
+                        Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                    );
+                }
+            }
+        }
+
+        // Delineate community side color strips, grid dividers, and intra-network diagonal blocks
+        for blk in &blocks {
+            let bcol = Color32::from_rgb(blk.rgb[0], blk.rgb[1], blk.rgb[2]);
+            let x0 = rect.left() + (blk.start as f32) * cell;
+            let x1 = rect.left() + (blk.end as f32) * cell;
+            let y0 = rect.top() + (blk.start as f32) * cell;
+            let y1 = rect.top() + (blk.end as f32) * cell;
+
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(x0, outer.top()), Pos2::new(x1, rect.top() - 1.0)),
+                0.0,
+                bcol,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(outer.left(), y0), Pos2::new(rect.left() - 1.0, y1)),
+                0.0,
+                bcol,
+            );
+            painter.rect_stroke(
+                Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)),
+                0.0,
+                Stroke::new(1.25_f32, Color32::from_rgba_unmultiplied(blk.rgb[0], blk.rgb[1], blk.rgb[2], 210)),
+                egui::StrokeKind::Inside,
+            );
+            if blk.start > 0 {
+                let div_col = Color32::from_rgba_unmultiplied(148, 163, 184, 52);
+                painter.line_segment(
+                    [Pos2::new(x0, rect.top()), Pos2::new(x0, rect.bottom())],
+                    Stroke::new(0.8_f32, div_col),
+                );
+                painter.line_segment(
+                    [Pos2::new(rect.left(), y0), Pos2::new(rect.right(), y0)],
+                    Stroke::new(0.8_f32, div_col),
+                );
+            }
+        }
+
         let cell_at = |pos: Pos2| -> Option<(usize, usize)> {
             if !rect.contains(pos) {
                 return None;
@@ -1072,15 +1385,15 @@ impl ConnectomeAtlasApp {
         let mut clicked_rid: Option<String> = None;
         if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                if let Some((row, _col)) = cell_at(pos) {
-                    clicked_rid = Some(self.atlas.regions[row].id.clone());
+                if let Some((row_pos, _col_pos)) = cell_at(pos) {
+                    clicked_rid = Some(self.atlas.regions[sorted_order[row_pos]].id.clone());
                 }
             }
         }
         if let Some(pos) = resp.hover_pos() {
-            if let Some((row, col)) = cell_at(pos) {
+            if let Some((row_pos, col_pos)) = cell_at(pos) {
                 let hover_rect = Rect::from_min_size(
-                    Pos2::new(rect.left() + (col as f32) * cell, rect.top() + (row as f32) * cell),
+                    Pos2::new(rect.left() + (col_pos as f32) * cell, rect.top() + (row_pos as f32) * cell),
                     Vec2::splat(cell.max(2.0)),
                 );
                 painter.rect_stroke(
@@ -1089,12 +1402,17 @@ impl ConnectomeAtlasApp {
                     Stroke::new(1.0_f32, Color32::WHITE),
                     egui::StrokeKind::Inside,
                 );
-                let src_reg = &self.atlas.regions[row];
-                let dst_reg = &self.atlas.regions[col];
-                let tip = if row == col {
-                    format!("{} — {}", src_reg.id, src_reg.name)
+                let src_idx = sorted_order[row_pos];
+                let dst_idx = sorted_order[col_pos];
+                let src_reg = &self.atlas.regions[src_idx];
+                let dst_reg = &self.atlas.regions[dst_idx];
+                let tip = if src_idx == dst_idx {
+                    format!("{} — {} [{}]", src_reg.id, src_reg.name, src_reg.network)
                 } else {
-                    format!("{} -> {} | w={:.2}", src_reg.id, dst_reg.id, weights[row][col])
+                    format!(
+                        "{} [{}] -> {} [{}] | w={:.2}",
+                        src_reg.id, src_reg.network, dst_reg.id, dst_reg.network, weights[src_idx][dst_idx]
+                    )
                 };
                 resp.on_hover_text(tip);
             }
@@ -1102,6 +1420,417 @@ impl ConnectomeAtlasApp {
         if let Some(rid) = clicked_rid {
             self.select_region(rid.clone(), true);
             self.status_msg = format!("Selected region {rid} from matrix.");
+        }
+
+        // Calibrated colorbar legend + community legend chips
+        ui.add_space(6.0);
+        let bar_w = side;
+        let (bar_resp, bar_painter) = ui.allocate_painter(Vec2::new(bar_w, 26.0), Sense::hover());
+        let br = bar_resp.rect;
+        let grad_rect = Rect::from_min_size(br.min, Vec2::new(bar_w, 10.0));
+        let steps = 40_usize;
+        let seg_w = grad_rect.width() / (steps as f32);
+        for s in 0..steps {
+            let t = (s as f32 + 0.5) / (steps as f32);
+            let rgb = matrix_weight_rgb(t);
+            let seg = Rect::from_min_size(
+                Pos2::new(grad_rect.left() + (s as f32) * seg_w, grad_rect.top()),
+                Vec2::new(seg_w + 0.5, grad_rect.height()),
+            );
+            bar_painter.rect_filled(seg, 0.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+        }
+        bar_painter.rect_stroke(
+            grad_rect,
+            0.0,
+            Stroke::new(0.8_f32, Color32::from_rgb(71, 85, 105)),
+            egui::StrokeKind::Inside,
+        );
+        let mw_x = grad_rect.left() + (self.min_weight as f32).clamp(0.0, 1.0) * grad_rect.width();
+        bar_painter.line_segment(
+            [Pos2::new(mw_x, grad_rect.top() - 1.0), Pos2::new(mw_x, grad_rect.bottom() + 2.0)],
+            Stroke::new(1.5_f32, Color32::WHITE),
+        );
+        let lbl_col = Color32::from_rgb(148, 163, 184);
+        bar_painter.text(
+            Pos2::new(grad_rect.left(), grad_rect.bottom() + 2.0),
+            egui::Align2::LEFT_TOP,
+            "0.0",
+            FontId::proportional(9.5),
+            lbl_col,
+        );
+        bar_painter.text(
+            Pos2::new(grad_rect.center().x, grad_rect.bottom() + 2.0),
+            egui::Align2::CENTER_TOP,
+            format!("Weight w (min={:.2})", self.min_weight),
+            FontId::proportional(9.5),
+            lbl_col,
+        );
+        bar_painter.text(
+            Pos2::new(grad_rect.right(), grad_rect.bottom() + 2.0),
+            egui::Align2::RIGHT_TOP,
+            "1.0",
+            FontId::proportional(9.5),
+            lbl_col,
+        );
+
+        ui.horizontal_wrapped(|ui| {
+            for blk in &blocks {
+                let col = Color32::from_rgb(blk.rgb[0], blk.rgb[1], blk.rgb[2]);
+                ui.colored_label(col, format!("■ {}", blk.network));
+            }
+        });
+    }
+
+    fn ui_criticality_tda(&mut self, ui: &mut egui::Ui) {
+        let crit = &self.criticality;
+        ui.label(
+            egui::RichText::new(format!(
+                "Kinouchi-Copelli Criticality | kappa={:.2} | sigma={:.3} ({}) | Delta={:.2} dB",
+                crit.coupling_kappa,
+                crit.branching_ratio_sigma,
+                crit.regime.label(),
+                crit.dynamic_range_db
+            ))
+            .small()
+            .strong()
+            .color(Color32::from_rgb(125, 211, 252)),
+        );
+
+        // 1) Response Curve F(r)
+        let w = ui.available_width().min(345.0);
+        let (rc_resp, rc_p) = ui.allocate_painter(Vec2::new(w, 130.0), Sense::hover());
+        let rcr = rc_resp.rect;
+        rc_p.rect_filled(rcr, 4.0, Color32::from_rgb(10, 14, 22));
+        let pad_l = 32.0_f32;
+        let pad_r = 10.0_f32;
+        let pad_t = 16.0_f32;
+        let pad_b = 20.0_f32;
+        let plot_rc = Rect::from_min_max(
+            Pos2::new(rcr.left() + pad_l, rcr.top() + pad_t),
+            Pos2::new(rcr.right() - pad_r, rcr.bottom() - pad_b),
+        );
+        rc_p.rect_stroke(
+            plot_rc,
+            0.0,
+            Stroke::new(0.8_f32, Color32::from_rgb(51, 65, 85)),
+            egui::StrokeKind::Inside,
+        );
+        rc_p.text(
+            Pos2::new(rcr.left() + 6.0, rcr.top() + 3.0),
+            egui::Align2::LEFT_TOP,
+            format!("Response Curve F(r)  |  F0={:.3}, Fmax={:.3}", crit.spontaneous_floor_f0, crit.saturation_ceiling_fmax),
+            FontId::proportional(10.0),
+            Color32::from_rgb(203, 213, 225),
+        );
+        if crit.response_curve.len() >= 2 {
+            let log_min = crit.response_curve.first().map(|p| p.log10_stimulus_r as f32).unwrap_or(-5.2);
+            let log_max = crit.response_curve.last().map(|p| p.log10_stimulus_r as f32).unwrap_or(0.6);
+            let log_span = (log_max - log_min).max(1e-3);
+            let y_max = (crit.saturation_ceiling_fmax as f32 * 1.08).max(0.05);
+            let map_rc = |lr: f32, f: f32| -> Pos2 {
+                let tx = ((lr - log_min) / log_span).clamp(0.0, 1.0);
+                let ty = (f / y_max).clamp(0.0, 1.0);
+                Pos2::new(
+                    plot_rc.left() + tx * plot_rc.width(),
+                    plot_rc.bottom() - ty * plot_rc.height(),
+                )
+            };
+
+            // Shade [r10, r90] dynamic range window
+            let lr10 = (crit.r10_threshold.max(1e-9).log10() as f32).clamp(log_min, log_max);
+            let lr90 = (crit.r90_threshold.max(1e-9).log10() as f32).clamp(log_min, log_max);
+            let x10 = map_rc(lr10, 0.0).x;
+            let x90 = map_rc(lr90, 0.0).x;
+            rc_p.rect_filled(
+                Rect::from_min_max(Pos2::new(x10, plot_rc.top()), Pos2::new(x90, plot_rc.bottom())),
+                0.0,
+                Color32::from_rgba_unmultiplied(56, 189, 248, 28),
+            );
+            let f0_y = map_rc(log_min, crit.spontaneous_floor_f0 as f32).y;
+            rc_p.line_segment(
+                [Pos2::new(plot_rc.left(), f0_y), Pos2::new(plot_rc.right(), f0_y)],
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(251, 146, 60, 140)),
+            );
+
+            let pts: Vec<Pos2> = crit
+                .response_curve
+                .iter()
+                .map(|p| map_rc(p.log10_stimulus_r as f32, p.mean_firing_response as f32))
+                .collect();
+            rc_p.add(egui::Shape::line(pts.clone(), Stroke::new(2.0_f32, Color32::from_rgb(56, 189, 248))));
+            for pt in &pts {
+                rc_p.circle_filled(*pt, 2.2, Color32::from_rgb(125, 211, 252));
+            }
+            if let Some(hp) = rc_resp.hover_pos() {
+                if plot_rc.contains(hp) {
+                    if let Some(best) = crit
+                        .response_curve
+                        .iter()
+                        .min_by(|a, b| {
+                            let ax = map_rc(a.log10_stimulus_r as f32, a.mean_firing_response as f32).x;
+                            let bx = map_rc(b.log10_stimulus_r as f32, b.mean_firing_response as f32).x;
+                            (ax - hp.x).abs().total_cmp(&(bx - hp.x).abs())
+                        })
+                    {
+                        let sp = map_rc(best.log10_stimulus_r as f32, best.mean_firing_response as f32);
+                        rc_p.circle_filled(sp, 4.0, Color32::WHITE);
+                        rc_resp.on_hover_text(format!(
+                            "log10(r)={:.2} (r={:.2e}) | F(r)={:.4}",
+                            best.log10_stimulus_r, best.stimulus_r, best.mean_firing_response
+                        ));
+                    }
+                }
+            }
+        }
+        rc_p.text(
+            Pos2::new(plot_rc.center().x, rcr.bottom() - 2.0),
+            egui::Align2::CENTER_BOTTOM,
+            "log10(stimulus r)  [shaded: r10..r90 Delta]",
+            FontId::proportional(9.0),
+            Color32::from_rgb(148, 163, 184),
+        );
+
+        // 2) Coupling Sweep kappa -> Dynamic Range Delta (dB)
+        ui.add_space(6.0);
+        let (ks_resp, ks_p) = ui.allocate_painter(Vec2::new(w, 125.0), Sense::click());
+        let ksr = ks_resp.rect;
+        ks_p.rect_filled(ksr, 4.0, Color32::from_rgb(10, 14, 22));
+        let plot_ks = Rect::from_min_max(
+            Pos2::new(ksr.left() + pad_l, ksr.top() + pad_t),
+            Pos2::new(ksr.right() - pad_r, ksr.bottom() - pad_b),
+        );
+        ks_p.rect_stroke(
+            plot_ks,
+            0.0,
+            Stroke::new(0.8_f32, Color32::from_rgb(51, 65, 85)),
+            egui::StrokeKind::Inside,
+        );
+        ks_p.text(
+            Pos2::new(ksr.left() + 6.0, ksr.top() + 3.0),
+            egui::Align2::LEFT_TOP,
+            "Coupling Sweep Delta(kappa) [click to tune kappa]",
+            FontId::proportional(10.0),
+            Color32::from_rgb(203, 213, 225),
+        );
+        let mut clicked_kappa: Option<f64> = None;
+        if crit.kappa_sweep.len() >= 2 {
+            let k_min = crit.kappa_sweep.first().map(|p| p.coupling_kappa as f32).unwrap_or(0.45);
+            let k_max = crit.kappa_sweep.last().map(|p| p.coupling_kappa as f32).unwrap_or(1.72);
+            let k_span = (k_max - k_min).max(1e-3);
+            let db_max = crit
+                .kappa_sweep
+                .iter()
+                .map(|p| p.dynamic_range_db as f32)
+                .fold(10.0_f32, f32::max)
+                * 1.12;
+            let map_ks = |kv: f32, db: f32| -> Pos2 {
+                let tx = ((kv - k_min) / k_span).clamp(0.0, 1.0);
+                let ty = (db / db_max).clamp(0.0, 1.0);
+                Pos2::new(
+                    plot_ks.left() + tx * plot_ks.width(),
+                    plot_ks.bottom() - ty * plot_ks.height(),
+                )
+            };
+            let x_crit = map_ks(1.0, 0.0).x;
+            ks_p.line_segment(
+                [Pos2::new(x_crit, plot_ks.top()), Pos2::new(x_crit, plot_ks.bottom())],
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(52, 211, 153, 140)),
+            );
+            let pts: Vec<Pos2> = crit
+                .kappa_sweep
+                .iter()
+                .map(|p| map_ks(p.coupling_kappa as f32, p.dynamic_range_db as f32))
+                .collect();
+            ks_p.add(egui::Shape::line(pts.clone(), Stroke::new(2.0_f32, Color32::from_rgb(250, 204, 21))));
+            for pt in &pts {
+                ks_p.circle_filled(*pt, 2.4, Color32::from_rgb(253, 224, 71));
+            }
+            let cur_pt = map_ks(crit.coupling_kappa as f32, crit.dynamic_range_db as f32);
+            ks_p.circle_filled(cur_pt, 4.5, Color32::from_rgb(52, 211, 153));
+            ks_p.circle_stroke(cur_pt, 5.5, Stroke::new(1.2_f32, Color32::WHITE));
+
+            if ks_resp.clicked() {
+                if let Some(cp) = ks_resp.interact_pointer_pos() {
+                    if plot_ks.contains(cp) {
+                        let frac = ((cp.x - plot_ks.left()) / plot_ks.width()).clamp(0.0, 1.0);
+                        clicked_kappa = Some((k_min + frac * k_span) as f64);
+                    }
+                }
+            }
+            if let Some(hp) = ks_resp.hover_pos() {
+                if plot_ks.contains(hp) {
+                    if let Some(best) = crit
+                        .kappa_sweep
+                        .iter()
+                        .min_by(|a, b| {
+                            let ax = map_ks(a.coupling_kappa as f32, a.dynamic_range_db as f32).x;
+                            let bx = map_ks(b.coupling_kappa as f32, b.dynamic_range_db as f32).x;
+                            (ax - hp.x).abs().total_cmp(&(bx - hp.x).abs())
+                        })
+                    {
+                        ks_resp.on_hover_text(format!(
+                            "kappa={:.2} | sigma={:.3} | Delta={:.2} dB",
+                            best.coupling_kappa, best.branching_ratio_sigma, best.dynamic_range_db
+                        ));
+                    }
+                }
+            }
+        }
+        ks_p.text(
+            Pos2::new(plot_ks.center().x, ksr.bottom() - 2.0),
+            egui::Align2::CENTER_BOTTOM,
+            "Coupling kappa (green line: critical kappa = 1.00)",
+            FontId::proportional(9.0),
+            Color32::from_rgb(148, 163, 184),
+        );
+        if let Some(new_k) = clicked_kappa {
+            self.criticality_kappa = new_k.clamp(0.40, 1.80);
+            self.recompute();
+            self.status_msg = format!(
+                "Tuned kappa = {:.2} (sigma = {:.3}).",
+                self.criticality_kappa, self.criticality.branching_ratio_sigma
+            );
+        }
+
+        // 3) TDA Persistent Homology beta-1 Persistence Barcode
+        ui.add_space(8.0);
+        let tda = &self.topology_tda;
+        ui.label(
+            egui::RichText::new(format!(
+                "TDA Z2 Persistent Homology | 3-Cliq: {} | 4-Cliq: {} | beta-1: {} ({} essential)",
+                tda.clique_3_total,
+                tda.clique_4_total,
+                tda.persistent_beta1_count,
+                tda.essential_beta1_count
+            ))
+            .small()
+            .strong()
+            .color(Color32::from_rgb(45, 212, 191)),
+        );
+        let n_bars = tda.cavities.len().min(14);
+        let bar_h = (n_bars.max(3) as f32 * 14.0 + 34.0).clamp(76.0, 236.0);
+        let (bc_resp, bc_p) = ui.allocate_painter(Vec2::new(w, bar_h), Sense::click());
+        let bcr = bc_resp.rect;
+        bc_p.rect_filled(bcr, 4.0, Color32::from_rgb(10, 14, 22));
+        let plot_bc = Rect::from_min_max(
+            Pos2::new(bcr.left() + 36.0, bcr.top() + 16.0),
+            Pos2::new(bcr.right() - 12.0, bcr.bottom() - 18.0),
+        );
+        bc_p.rect_stroke(
+            plot_bc,
+            0.0,
+            Stroke::new(0.8_f32, Color32::from_rgb(51, 65, 85)),
+            egui::StrokeKind::Inside,
+        );
+        bc_p.text(
+            Pos2::new(bcr.left() + 6.0, bcr.top() + 3.0),
+            egui::Align2::LEFT_TOP,
+            "H1 (beta-1) Persistence Barcode [w_birth -> w_death]",
+            FontId::proportional(10.0),
+            Color32::from_rgb(203, 213, 225),
+        );
+        let mut clicked_cavity_node: Option<String> = None;
+        if n_bars == 0 {
+            bc_p.text(
+                plot_bc.center(),
+                egui::Align2::CENTER_CENTER,
+                "No persistent beta-1 cavities at current min_weight.",
+                FontId::proportional(10.5),
+                Color32::from_rgb(148, 163, 184),
+            );
+        } else {
+            let row_h = plot_bc.height() / (n_bars as f32);
+            let map_w = |weight: f64| -> f32 {
+                // Descending weight filtration: birth at high weight (left) -> death at low weight (right)
+                let t = (1.0 - weight.clamp(0.0, 1.0)) as f32;
+                plot_bc.left() + t * plot_bc.width()
+            };
+            let mut hovered_tip: Option<String> = None;
+            let hover_pos = bc_resp.hover_pos();
+            let click_pos = if bc_resp.clicked() { bc_resp.interact_pointer_pos() } else { None };
+            for (idx, cav) in tda.cavities.iter().take(n_bars).enumerate() {
+                let y_mid = plot_bc.top() + (idx as f32 + 0.5) * row_h;
+                let x_start = map_w(cav.birth_weight);
+                let x_end = map_w(cav.death_weight).max(x_start + 3.0);
+                let col = if cav.is_essential {
+                    Color32::from_rgb(250, 204, 21)
+                } else {
+                    Color32::from_rgb(34, 211, 238)
+                };
+                bc_p.text(
+                    Pos2::new(plot_bc.left() - 4.0, y_mid),
+                    egui::Align2::RIGHT_CENTER,
+                    format!("g{}", cav.cavity_index),
+                    FontId::proportional(9.5),
+                    col,
+                );
+                let bar_rect = Rect::from_min_max(
+                    Pos2::new(x_start, y_mid - (row_h * 0.28).min(4.0)),
+                    Pos2::new(x_end, y_mid + (row_h * 0.28).min(4.0)),
+                );
+                bc_p.rect_filled(bar_rect, 1.5, col);
+                if cav.is_essential {
+                    bc_p.circle_filled(Pos2::new(x_end, y_mid), 2.5, Color32::from_rgb(52, 211, 153));
+                }
+                let row_band = Rect::from_min_max(
+                    Pos2::new(bcr.left(), plot_bc.top() + (idx as f32) * row_h),
+                    Pos2::new(bcr.right(), plot_bc.top() + ((idx + 1) as f32) * row_h),
+                );
+                if let Some(hp) = hover_pos {
+                    if row_band.contains(hp) {
+                        bc_p.rect_stroke(
+                            bar_rect.expand(1.5),
+                            1.5,
+                            Stroke::new(1.0_f32, Color32::WHITE),
+                            egui::StrokeKind::Outside,
+                        );
+                        hovered_tip = Some(format!(
+                            "gamma_{} [{:.2} -> {:.2}{}] | pi={:.3} ({} nodes)\n{}",
+                            cav.cavity_index,
+                            cav.birth_weight,
+                            cav.death_weight,
+                            if cav.is_essential { " inf" } else { "" },
+                            cav.persistence,
+                            cav.cycle_nodes.len(),
+                            cav.cycle_nodes.join(" -> ")
+                        ));
+                    }
+                }
+                if let Some(cp) = click_pos {
+                    if row_band.contains(cp) {
+                        clicked_cavity_node = cav.cycle_nodes.first().cloned();
+                    }
+                }
+            }
+            if let Some(tip) = hovered_tip {
+                bc_resp.on_hover_text(tip);
+            }
+        }
+        bc_p.text(
+            Pos2::new(plot_bc.left(), bcr.bottom() - 2.0),
+            egui::Align2::LEFT_BOTTOM,
+            "w=1.0",
+            FontId::proportional(9.0),
+            Color32::from_rgb(148, 163, 184),
+        );
+        bc_p.text(
+            Pos2::new(plot_bc.center().x, bcr.bottom() - 2.0),
+            egui::Align2::CENTER_BOTTOM,
+            "Descending Filtration Weight (gold=essential)",
+            FontId::proportional(9.0),
+            Color32::from_rgb(148, 163, 184),
+        );
+        bc_p.text(
+            Pos2::new(plot_bc.right(), bcr.bottom() - 2.0),
+            egui::Align2::RIGHT_BOTTOM,
+            "w=0.0",
+            FontId::proportional(9.0),
+            Color32::from_rgb(148, 163, 184),
+        );
+        if let Some(rid) = clicked_cavity_node {
+            self.select_region(rid.clone(), true);
+            self.color_mode = ColorSchemeMode::TdaBeta1Loops;
+            self.status_msg = format!("Selected TDA loop participant {rid}.");
         }
     }
 
@@ -1211,7 +1940,10 @@ impl ConnectomeAtlasApp {
             match loaded_res {
                 Some(Ok(loaded)) => {
                     self.atlas = loaded;
+                    self.conduction_velocity_m_s = self.atlas.conduction_velocity_m_s as f32;
                     self.selected_region = self.atlas.regions.first().map(|r| r.id.clone());
+                    self.path_source = self.atlas.regions.first().map(|r| r.id.clone());
+                    self.path_target = self.atlas.regions.last().map(|r| r.id.clone());
                     self.apply_species_framing();
                     self.recompute();
                     self.status_msg = format!("Loaded snapshot '{slot_name}'.");
@@ -1253,7 +1985,13 @@ impl ConnectomeAtlasApp {
             }
         }
 
-        if response.dragged() {
+        if response.dragged_by(egui::PointerButton::Secondary)
+            || response.dragged_by(egui::PointerButton::Middle)
+        {
+            let d = response.drag_delta();
+            self.fly_ctrl.active = false;
+            self.camera.pan(glam::Vec2::new(d.x, d.y), rect.height());
+        } else if response.dragged_by(egui::PointerButton::Primary) {
             let d = response.drag_delta();
             self.fly_ctrl.active = false;
             self.camera.orbit(glam::Vec2::new(d.x, d.y));
@@ -1266,8 +2004,9 @@ impl ConnectomeAtlasApp {
         }
 
         let wh = [rect.width(), rect.height()];
-        let to_screen = |pt: [f32; 3], cam: &OrbitCamera| -> Option<(Pos2, f32)> {
-            cam.project_point(pt, wh)
+        let vp = self.camera.view_proj_matrix(wh[0] / wh[1].max(1.0));
+        let to_screen = |pt: [f32; 3]| -> Option<(Pos2, f32)> {
+            OrbitCamera::project_point_with_vp(vp, pt, wh)
                 .map(|([x, y], z)| (Pos2::new(rect.left() + x, rect.top() + y), z))
         };
 
@@ -1354,7 +2093,7 @@ impl ConnectomeAtlasApp {
                 let c = mesh.clippable
                     && is_point_clipped_by_cutaway(*v, self.cutaway_mode, self.cutaway_offset_mm);
                 clipped.push(c);
-                proj.push(to_screen(*v, &self.camera));
+                proj.push(to_screen(*v));
             }
 
             for tri in &mesh.triangles {
@@ -1372,7 +2111,7 @@ impl ConnectomeAtlasApp {
                             if ca != cb {
                                 let mid = Vec3::from_array(mesh.vertices[a])
                                     .lerp(Vec3::from_array(mesh.vertices[b]), 0.5);
-                                if let Some((sp, _)) = to_screen(mid.to_array(), &self.camera) {
+                                if let Some((sp, _)) = to_screen(mid.to_array()) {
                                     cut_pts.push(sp);
                                 }
                             }
@@ -1484,14 +2223,14 @@ impl ConnectomeAtlasApp {
             for g in (-ext_i..=ext_i).step_by(step as usize) {
                 let gf = g as f32;
                 if let (Some((a, _)), Some((b, _))) = (
-                    to_screen([-ext, gf, self.slice_z_mm], &self.camera),
-                    to_screen([ext, gf, self.slice_z_mm], &self.camera),
+                    to_screen([-ext, gf, self.slice_z_mm]),
+                    to_screen([ext, gf, self.slice_z_mm]),
                 ) {
                     painter.line_segment([a, b], Stroke::new(1.0_f32, grid_col));
                 }
                 if let (Some((a, _)), Some((b, _))) = (
-                    to_screen([gf, -ext, self.slice_z_mm], &self.camera),
-                    to_screen([gf, ext, self.slice_z_mm], &self.camera),
+                    to_screen([gf, -ext, self.slice_z_mm]),
+                    to_screen([gf, ext, self.slice_z_mm]),
                 ) {
                     painter.line_segment([a, b], Stroke::new(1.0_f32, grid_col));
                 }
@@ -1507,6 +2246,47 @@ impl ConnectomeAtlasApp {
         let mut betw_map = HashMap::new();
         for nm in &self.metrics.node_metrics {
             betw_map.insert(nm.region_id.as_str(), nm.betweenness_centrality);
+        }
+
+        // Field lookup maps for Harmonic psi_k, Criticality sigma_i, and TDA beta-1 loops
+        let mut harmonic_map: HashMap<&str, f32> = HashMap::new();
+        if let Some(mode_vec) = self
+            .control_harmonics
+            .harmonic_modes
+            .get(self.harmonic_mode_idx.saturating_sub(1))
+        {
+            let max_abs = mode_vec
+                .iter()
+                .map(|v| v.abs())
+                .fold(1e-6_f64, f64::max);
+            for (r, &val) in self.atlas.regions.iter().zip(mode_vec.iter()) {
+                harmonic_map.insert(r.id.as_str(), (val / max_abs) as f32);
+            }
+        }
+        let mut crit_map: HashMap<&str, f32> = HashMap::new();
+        for cp in &self.criticality.node_profiles {
+            crit_map.insert(cp.region_id.as_str(), cp.avalanche_susceptibility as f32);
+        }
+        let mut tda_node_map: HashMap<&str, (usize, f32)> = HashMap::new();
+        for tp in &self.topology_tda.node_profiles {
+            tda_node_map.insert(
+                tp.region_id.as_str(),
+                (tp.beta1_loop_participation, tp.topological_cavity_score as f32),
+            );
+        }
+        let mut tda_loop_edges: HashSet<(&str, &str)> = HashSet::new();
+        for cav in &self.topology_tda.cavities {
+            let cyc = &cav.cycle_nodes;
+            if cyc.len() >= 2 {
+                for w in cyc.windows(2) {
+                    tda_loop_edges.insert((w[0].as_str(), w[1].as_str()));
+                    tda_loop_edges.insert((w[1].as_str(), w[0].as_str()));
+                }
+                let first = cyc[0].as_str();
+                let last = cyc[cyc.len() - 1].as_str();
+                tda_loop_edges.insert((first, last));
+                tda_loop_edges.insert((last, first));
+            }
         }
 
         let mut path_pairs = Vec::new();
@@ -1531,6 +2311,8 @@ impl ConnectomeAtlasApp {
                 (u == edge.source && v == edge.target)
                     || (!edge.directed && u == edge.target && v == edge.source)
             });
+            let on_tda_loop =
+                tda_loop_edges.contains(&(edge.source.as_str(), edge.target.as_str()));
 
             let base_rgb = match self.color_mode {
                 ColorSchemeMode::FunctionalNetwork => color_map
@@ -1541,7 +2323,28 @@ impl ConnectomeAtlasApp {
                     let dec = DecColor::from_endpoints(c_a, c_b);
                     [dec.r, dec.g, dec.b]
                 }
-                ColorSchemeMode::BetweennessHeatmap => [96, 165, 250],
+                ColorSchemeMode::BetweennessHeatmap => {
+                    let ba = betw_map.get(edge.source.as_str()).copied().unwrap_or(0.0) as f32;
+                    let bb = betw_map.get(edge.target.as_str()).copied().unwrap_or(0.0) as f32;
+                    betweenness_rgb(((ba + bb) * 0.5 * 4.5).clamp(0.0, 1.0))
+                }
+                ColorSchemeMode::HarmonicModePsi => {
+                    let ha = harmonic_map.get(edge.source.as_str()).copied().unwrap_or(0.0);
+                    let hb = harmonic_map.get(edge.target.as_str()).copied().unwrap_or(0.0);
+                    diverging_harmonic_rgb((ha + hb) * 0.5)
+                }
+                ColorSchemeMode::CriticalitySusceptibility => {
+                    let ca = crit_map.get(edge.source.as_str()).copied().unwrap_or(0.0);
+                    let cb = crit_map.get(edge.target.as_str()).copied().unwrap_or(0.0);
+                    thermal_plasma_rgb((ca + cb) * 0.5)
+                }
+                ColorSchemeMode::TdaBeta1Loops => {
+                    if on_tda_loop {
+                        [45, 226, 200]
+                    } else {
+                        [62, 82, 118]
+                    }
+                }
             };
 
             let strands = match self.tract_style {
@@ -1555,15 +2358,27 @@ impl ConnectomeAtlasApp {
             for (strand_i, curve) in strands.iter().enumerate() {
                 let n_seg = curve.len().saturating_sub(1);
                 for s_idx in 0..n_seg {
-                    let (Some((p0, _)), Some((p1, _))) = (
-                        to_screen(curve[s_idx], &self.camera),
-                        to_screen(curve[s_idx + 1], &self.camera),
-                    ) else {
+                    let (Some((p0, _)), Some((p1, _))) =
+                        (to_screen(curve[s_idx]), to_screen(curve[s_idx + 1]))
+                    else {
                         continue;
                     };
                     let u_frac = (s_idx as f32) / (n_seg.max(1) as f32);
                     let wave =
                         0.78 + 0.22 * ((u_frac - self.tonic_phase) * std::f32::consts::TAU).sin();
+                    let seg_rgb = match self.color_mode {
+                        ColorSchemeMode::HarmonicModePsi if !on_shortest_path => {
+                            let ha = harmonic_map.get(edge.source.as_str()).copied().unwrap_or(0.0);
+                            let hb = harmonic_map.get(edge.target.as_str()).copied().unwrap_or(0.0);
+                            diverging_harmonic_rgb(ha + (hb - ha) * u_frac)
+                        }
+                        ColorSchemeMode::CriticalitySusceptibility if !on_shortest_path => {
+                            let ca = crit_map.get(edge.source.as_str()).copied().unwrap_or(0.0);
+                            let cb = crit_map.get(edge.target.as_str()).copied().unwrap_or(0.0);
+                            thermal_plasma_rgb(ca + (cb - ca) * u_frac)
+                        }
+                        _ => base_rgb,
+                    };
                     let (col, width) = if on_shortest_path {
                         (
                             Color32::from_rgba_unmultiplied(
@@ -1575,19 +2390,32 @@ impl ConnectomeAtlasApp {
                             3.6,
                         )
                     } else {
-                        let alpha =
-                            ((edge.weight as f32 * 145.0 + 42.0) * wave).clamp(32.0, 210.0) as u8;
+                        let base_alpha = if self.color_mode == ColorSchemeMode::TdaBeta1Loops {
+                            if on_tda_loop {
+                                (edge.weight as f32 * 135.0 + 95.0) * wave
+                            } else {
+                                (edge.weight as f32 * 45.0 + 18.0) * wave
+                            }
+                        } else {
+                            (edge.weight as f32 * 145.0 + 42.0) * wave
+                        };
+                        let alpha = base_alpha.clamp(16.0, 232.0) as u8;
+                        let boost = if self.color_mode == ColorSchemeMode::TdaBeta1Loops && on_tda_loop {
+                            0.55
+                        } else {
+                            0.0
+                        };
                         (
                             Color32::from_rgba_unmultiplied(
-                                base_rgb[0],
-                                base_rgb[1],
-                                base_rgb[2],
+                                seg_rgb[0],
+                                seg_rgb[1],
+                                seg_rgb[2],
                                 alpha,
                             ),
                             if strand_i == 0 {
-                                1.25 + (edge.weight as f32) * 1.1
+                                1.25 + (edge.weight as f32) * 1.1 + boost
                             } else {
-                                0.70 + (edge.weight as f32) * 0.55
+                                0.70 + (edge.weight as f32) * 0.55 + boost * 0.4
                             },
                         )
                     };
@@ -1596,8 +2424,9 @@ impl ConnectomeAtlasApp {
             }
         }
 
-        // Pass 5: 3D Crossing-Fiber Diffusion Tensor Glyphs
+        // Pass 5: 3D Crossing-Fiber Diffusion Tensor Ellipsoid Glyphs (3-Axis Shaded + Orthogonal Axes)
         if self.show_tensor_glyphs {
+            let mut tensor_tris: Vec<ShadedTri> = Vec::new();
             for r in &self.atlas.regions {
                 if self.atlas.ablated_regions.contains(&r.id) {
                     continue;
@@ -1607,33 +2436,73 @@ impl ConnectomeAtlasApp {
                         continue;
                     }
                     let u = Vec3::from_array(ft.principal_axis).normalize_or_zero();
-                    let span = (r.radius_mm * (1.2 + 0.9 * ft.fractional_anisotropy as f32)).min(8.5);
-                    let a = Vec3::from_array(r.coord) - u * span;
-                    let b = Vec3::from_array(r.coord) + u * span;
-                    if let (Some((pa, _)), Some((pb, _))) =
-                        (to_screen(a.to_array(), &self.camera), to_screen(b.to_array(), &self.camera))
-                    {
-                        let rgb = [
-                            (u.x.abs() * 230.0 + 25.0) as u8,
-                            (u.y.abs() * 230.0 + 25.0) as u8,
-                            (u.z.abs() * 230.0 + 25.0) as u8,
-                        ];
-                        painter.line_segment(
-                            [pa, pb],
-                            Stroke::new(
-                                1.6_f32,
-                                Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], 145),
-                            ),
-                        );
+                    let span = (r.radius_mm * (1.25 + 0.80 * ft.fractional_anisotropy as f32)).min(9.5);
+                    let glyph = generate_tensor_ellipsoid_mesh(r.coord, ft, span, 4, 8);
+                    let rgb = [
+                        (u.x.abs() * 230.0 + 25.0) as u8,
+                        (u.y.abs() * 230.0 + 25.0) as u8,
+                        (u.z.abs() * 230.0 + 25.0) as u8,
+                    ];
+
+                    let g_proj: Vec<Option<(Pos2, f32)>> =
+                        glyph.vertices.iter().map(|&v| to_screen(v)).collect();
+                    for tri in &glyph.triangles {
+                        let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+                        let (Some((p0, d0)), Some((p1, d1)), Some((p2, d2))) =
+                            (g_proj[i0], g_proj[i1], g_proj[i2])
+                        else {
+                            continue;
+                        };
+                        let w0 = Vec3::from_array(glyph.vertices[i0]);
+                        let w1 = Vec3::from_array(glyph.vertices[i1]);
+                        let w2 = Vec3::from_array(glyph.vertices[i2]);
+                        let face_n = (w1 - w0).cross(w2 - w0);
+                        let face_c = (w0 + w1 + w2) / 3.0;
+                        if face_n.dot(eye - face_c) <= 0.0 {
+                            continue;
+                        }
+                        let shade_g = |wp: Vec3, wn: Vec3| -> Color32 {
+                            let n = wn.normalize_or_zero();
+                            let v = (eye - wp).normalize_or_zero();
+                            let diff = 0.38 + 0.56 * n.dot(light_key).max(0.0) + 0.22 * n.dot(light_rim).max(0.0);
+                            let fres = (1.0 - n.dot(v).abs().clamp(0.0, 1.0)).powf(1.8);
+                            Color32::from_rgba_unmultiplied(
+                                (rgb[0] as f32 * diff + 180.0 * fres * 0.25).clamp(0.0, 255.0) as u8,
+                                (rgb[1] as f32 * diff + 210.0 * fres * 0.25).clamp(0.0, 255.0) as u8,
+                                (rgb[2] as f32 * diff + 240.0 * fres * 0.25).clamp(0.0, 255.0) as u8,
+                                92,
+                            )
+                        };
+                        tensor_tris.push(ShadedTri {
+                            depth: (d0 + d1 + d2) / 3.0,
+                            p: [p0, p1, p2],
+                            c: [
+                                shade_g(w0, Vec3::from_array(glyph.normals[i0])),
+                                shade_g(w1, Vec3::from_array(glyph.normals[i1])),
+                                shade_g(w2, Vec3::from_array(glyph.normals[i2])),
+                            ],
+                        });
+                    }
+
+                    for (ax_idx, &(ea, eb)) in glyph.axis_segments.iter().enumerate() {
+                        if let (Some((pa, _)), Some((pb, _))) = (to_screen(ea), to_screen(eb)) {
+                            let (ax_col, ax_w) = if ax_idx == 0 {
+                                (Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], 195), 1.8_f32)
+                            } else {
+                                (Color32::from_rgba_unmultiplied(186, 230, 253, 120), 1.0_f32)
+                            };
+                            painter.line_segment([pa, pb], Stroke::new(ax_w, ax_col));
+                        }
                     }
                 }
             }
+            flush_tris(&mut tensor_tris);
         }
 
         // Pass 6: Depth-Sorted 3D Anatomical Region Parcels / Somas
         let mut projected_nodes = Vec::new();
         for r in &self.atlas.regions {
-            if let Some((sp, depth)) = to_screen(r.coord, &self.camera) {
+            if let Some((sp, depth)) = to_screen(r.coord) {
                 projected_nodes.push((r, sp, depth));
             }
         }
@@ -1663,12 +2532,29 @@ impl ConnectomeAtlasApp {
                 match self.color_mode {
                     ColorSchemeMode::BetweennessHeatmap => {
                         let b = betw_map.get(r.id.as_str()).copied().unwrap_or(0.0) as f32;
-                        let t = (b * 4.5).clamp(0.0, 1.0);
-                        [
-                            (50.0 + 205.0 * t) as u8,
-                            (190.0 - 95.0 * t) as u8,
-                            (245.0 - 190.0 * t) as u8,
-                        ]
+                        betweenness_rgb((b * 4.5).clamp(0.0, 1.0))
+                    }
+                    ColorSchemeMode::HarmonicModePsi => {
+                        let h = harmonic_map.get(r.id.as_str()).copied().unwrap_or(0.0);
+                        diverging_harmonic_rgb(h)
+                    }
+                    ColorSchemeMode::CriticalitySusceptibility => {
+                        let s = crit_map.get(r.id.as_str()).copied().unwrap_or(0.0);
+                        thermal_plasma_rgb(s)
+                    }
+                    ColorSchemeMode::TdaBeta1Loops => {
+                        let (loop_cnt, score) =
+                            tda_node_map.get(r.id.as_str()).copied().unwrap_or((0, 0.0));
+                        if loop_cnt > 0 {
+                            let t = score.clamp(0.25, 1.0);
+                            [
+                                (38.0 + 205.0 * t) as u8,
+                                (212.0 + 28.0 * (1.0 - t)) as u8,
+                                (205.0 - 135.0 * t) as u8,
+                            ]
+                        } else {
+                            [68, 92, 130]
+                        }
                     }
                     _ => parse_hex_color(&r.color_hex),
                 }
@@ -1723,7 +2609,7 @@ impl ConnectomeAtlasApp {
         if self.show_anatomical_labels {
             let mid_x = rect.center().x;
             for lm in &self.anatomy_scene.landmarks {
-                if let Some((sp, _)) = to_screen(lm.coord, &self.camera) {
+                if let Some((sp, _)) = to_screen(lm.coord) {
                     if !rect.contains(sp) {
                         continue;
                     }
@@ -1977,6 +2863,46 @@ fn parse_hex_color(hex: &str) -> [u8; 3] {
         [r, g, b]
     } else {
         [56, 189, 248]
+    }
+}
+
+fn lerp_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    let u = t.clamp(0.0, 1.0);
+    [
+        (a[0] as f32 + (b[0] as f32 - a[0] as f32) * u) as u8,
+        (a[1] as f32 + (b[1] as f32 - a[1] as f32) * u) as u8,
+        (a[2] as f32 + (b[2] as f32 - a[2] as f32) * u) as u8,
+    ]
+}
+
+fn betweenness_rgb(t: f32) -> [u8; 3] {
+    lerp_rgb([50, 190, 245], [255, 95, 55], t)
+}
+
+fn diverging_harmonic_rgb(val: f32) -> [u8; 3] {
+    let v = val.clamp(-1.0, 1.0);
+    if v < 0.0 {
+        lerp_rgb([100, 116, 139], [34, 211, 238], -v)
+    } else {
+        lerp_rgb([100, 116, 139], [251, 113, 62], v)
+    }
+}
+
+fn thermal_plasma_rgb(t: f32) -> [u8; 3] {
+    let u = t.clamp(0.0, 1.0);
+    if u < 0.5 {
+        lerp_rgb([37, 99, 235], [45, 212, 191], u * 2.0)
+    } else {
+        lerp_rgb([45, 212, 191], [250, 204, 21], (u - 0.5) * 2.0)
+    }
+}
+
+fn matrix_weight_rgb(w: f32) -> [u8; 3] {
+    let u = w.clamp(0.0, 1.0);
+    if u < 0.5 {
+        lerp_rgb([15, 34, 72], [34, 211, 238], u * 2.0)
+    } else {
+        lerp_rgb([34, 211, 238], [250, 204, 21], (u - 0.5) * 2.0)
     }
 }
 
@@ -2321,5 +3247,118 @@ mod tests {
         run_key(&mut app, Some(egui::Key::Escape));
         assert!(!app.zen_mode);
         assert!(app.show_left_panel && app.show_right_panel && app.show_bottom_slices);
+    }
+
+    #[test]
+    fn hotkeys_palette_enter_and_cached_lesion_delta_behave_accurately() {
+        let ctx = egui::Context::default();
+        let mut app = ConnectomeAtlasApp::new_headless(0);
+
+        let send_event = |app: &mut ConnectomeAtlasApp, key: egui::Key, mods: egui::Modifiers, text: Option<&str>| {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 900.0),
+                )),
+                modifiers: mods,
+                ..Default::default()
+            };
+            if let Some(t) = text {
+                raw.events.push(egui::Event::Text(t.to_string()));
+            }
+            raw.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: mods,
+            });
+            let _ = ctx.run(raw, |ctx| {
+                app.ui_step(ctx, false);
+            });
+        };
+
+        // Warmup frame
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.ui_step(ctx, false),
+        );
+
+        // Hotkeys 1-4 set presets and cancel fly-through
+        app.fly_ctrl.active = true;
+        send_event(&mut app, egui::Key::Num3, egui::Modifiers::NONE, None);
+        assert!(!app.fly_ctrl.active);
+        let (_, ax_pitch) = OrbitCamera::preset_angles(ViewPreset::SuperiorAxial);
+        assert!((app.camera.pitch_rad - ax_pitch).abs() < 1e-3);
+
+        // R resets camera to species default framing
+        send_event(&mut app, egui::Key::R, egui::Modifiers::NONE, None);
+        assert!((app.camera.yaw_rad - app.anatomy_scene.default_yaw).abs() < 1e-3);
+
+        // I / P / L probe modes and C cutaway cycle
+        send_event(&mut app, egui::Key::P, egui::Modifiers::NONE, None);
+        assert_eq!(app.probe_mode, ProbeMode::ShortestPath);
+        send_event(&mut app, egui::Key::L, egui::Modifiers::NONE, None);
+        assert_eq!(app.probe_mode, ProbeMode::LesionAblate);
+        send_event(&mut app, egui::Key::I, egui::Modifiers::NONE, None);
+        assert_eq!(app.probe_mode, ProbeMode::Inspect);
+        let before_cut = app.cutaway_mode;
+        send_event(&mut app, egui::Key::C, egui::Modifiers::NONE, None);
+        assert_ne!(app.cutaway_mode, before_cut);
+
+        // Ctrl+K palette focus blocks single-key viewport hotkeys & Enter executes top match
+        send_event(&mut app, egui::Key::K, egui::Modifiers::CTRL, None);
+        assert!(app.cmd_palette_open);
+        send_event(&mut app, egui::Key::P, egui::Modifiers::NONE, Some("broca"));
+        assert_eq!(app.probe_mode, ProbeMode::Inspect, "Typing inside Ctrl+K must not switch probe mode");
+        send_event(&mut app, egui::Key::Enter, egui::Modifiers::NONE, None);
+        assert!(!app.cmd_palette_open);
+        assert_eq!(app.selected_region.as_deref(), Some("LANG.Broca_L"));
+
+        // Cached lesion_delta matches evaluate_lesion_impact after toggling a lesion
+        app.atlas.toggle_tract_sever("Corpus Callosum");
+        app.recompute();
+        let expected = app.atlas.evaluate_lesion_impact(app.min_weight);
+        assert!((app.lesion_delta.efficiency_retention_pct - expected.efficiency_retention_pct).abs() < 1e-9);
+    }
+
+    #[test]
+    fn renders_all_color_modes_matrix_and_criticality_tda_plots_headless() {
+        let ctx = egui::Context::default();
+        let mut app = ConnectomeAtlasApp::new_headless(0);
+        let modes = [
+            ColorSchemeMode::FunctionalNetwork,
+            ColorSchemeMode::DtiDirectionalRgb,
+            ColorSchemeMode::BetweennessHeatmap,
+            ColorSchemeMode::HarmonicModePsi,
+            ColorSchemeMode::CriticalitySusceptibility,
+            ColorSchemeMode::TdaBeta1Loops,
+        ];
+        let tabs = [
+            RightTab::Inspector,
+            RightTab::AdjacencyMatrix,
+            RightTab::RichClubHubs,
+            RightTab::CriticalityTda,
+            RightTab::VaultIo,
+        ];
+        for (i, &mode) in modes.iter().enumerate() {
+            app.color_mode = mode;
+            app.right_tab = tabs[i % tabs.len()];
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1480.0, 920.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(raw, |ctx| app.ui_step(ctx, false));
+            assert!(!out.shapes.is_empty());
+        }
     }
 }

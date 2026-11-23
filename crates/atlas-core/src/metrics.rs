@@ -166,7 +166,7 @@ impl ConnectomeAtlas {
             }
         }
 
-        // All-pairs weighted Dijkstra (cost = 1.0 / weight) + shortest-path betweenness
+        // All-pairs weighted Dijkstra (cost = 1.0 / weight) + Brandes tied-path shortest-path betweenness
         let mut betweenness = vec![0.0_f64; n];
         let mut inv_dist_sum = 0.0_f64;
         let mut finite_dist_sum = 0.0_f64;
@@ -176,7 +176,7 @@ impl ConnectomeAtlas {
             if self.ablated_regions.contains(&self.regions[s].id) {
                 continue;
             }
-            let (dist, pred) = dijkstra_from(s, n, &adj);
+            let (dist, sigma, preds, order) = dijkstra_brandes_from(s, n, &adj);
             for t in 0..n {
                 if s == t || self.ablated_regions.contains(&self.regions[t].id) {
                     continue;
@@ -186,14 +186,16 @@ impl ConnectomeAtlas {
                     inv_dist_sum += 1.0 / d;
                     finite_dist_sum += d;
                     finite_pairs += 1;
-                    let mut cur = t;
-                    while let Some(p) = pred[cur] {
-                        if p == s {
-                            break;
-                        }
-                        betweenness[p] += 1.0;
-                        cur = p;
-                    }
+                }
+            }
+            let mut delta = vec![0.0_f64; n];
+            for &w in order.iter().rev() {
+                let coeff = (1.0 + delta[w]) / sigma[w].max(1.0);
+                for &p in &preds[w] {
+                    delta[p] += sigma[p] * coeff;
+                }
+                if w != s && !self.ablated_regions.contains(&self.regions[w].id) {
+                    betweenness[w] += delta[w];
                 }
             }
         }
@@ -306,9 +308,9 @@ impl ConnectomeAtlas {
             });
         }
 
-        // Matrix-Exponential Weighted Communicability G = exp(D^{-1/2} W D^{-1/2}) & Conduction Delays (9.6 m/s baseline)
+        // Matrix-Exponential Weighted Communicability G = exp(D^{-1/2} W D^{-1/2}) & Conduction Delays
         let comm_mat = self.compute_weighted_communicability_matrix(min_weight);
-        let default_vel_m_s = 9.6_f64;
+        let vel_m_s = self.configured_velocity_m_s();
         let mut delay_sum = 0.0_f64;
         let mut delay_cnt = 0_usize;
         let mut node_delay_acc = vec![(0.0_f64, 0_usize); n];
@@ -321,7 +323,7 @@ impl ConnectomeAtlas {
                 let cb = glam::Vec3::from_array(self.regions[v].coord);
                 let arch = if edge.modality == crate::model::PathwayModality::Commissural { 1.28 } else { 1.14 };
                 let len_mm = ((ca.distance(cb) as f64) * arch).max(2.0);
-                let tau_ms = len_mm / default_vel_m_s;
+                let tau_ms = len_mm / vel_m_s;
                 delay_sum += tau_ms;
                 delay_cnt += 1;
                 node_delay_acc[u].0 += tau_ms;
@@ -377,12 +379,40 @@ impl ConnectomeAtlas {
         }
     }
 
+    fn configured_velocity_m_s(&self) -> f64 {
+        if self.conduction_velocity_m_s.is_finite() && self.conduction_velocity_m_s > 0.0 {
+            self.conduction_velocity_m_s.max(0.1)
+        } else {
+            9.6
+        }
+    }
+
     pub fn shortest_signaling_path(
         &self,
         source_id: &str,
         target_id: &str,
         min_weight: f64,
     ) -> Option<PathResult> {
+        self.shortest_signaling_path_with_velocity(
+            source_id,
+            target_id,
+            min_weight,
+            self.configured_velocity_m_s(),
+        )
+    }
+
+    pub fn shortest_signaling_path_with_velocity(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        min_weight: f64,
+        conduction_velocity_m_s: f64,
+    ) -> Option<PathResult> {
+        let vel_m_s = if conduction_velocity_m_s.is_finite() && conduction_velocity_m_s > 0.0 {
+            conduction_velocity_m_s.max(0.1)
+        } else {
+            9.6
+        };
         let n = self.regions.len();
         let mut idx_of = HashMap::with_capacity(n);
         for (i, r) in self.regions.iter().enumerate() {
@@ -409,7 +439,7 @@ impl ConnectomeAtlas {
             }
         }
 
-        let (dist, pred) = dijkstra_from(s, n, &adj);
+        let (dist, _, preds, _) = dijkstra_brandes_from(s, n, &adj);
         if !dist[t].is_finite() {
             return None;
         }
@@ -418,8 +448,27 @@ impl ConnectomeAtlas {
         let mut cur = t;
         let mut bottleneck = f64::INFINITY;
         while cur != s {
-            let p = pred[cur]?;
-            if let Some(&(_, w)) = adj[p].iter().find(|&&(nbr, _)| nbr == cur) {
+            let p = *preds[cur]
+                .iter()
+                .max_by(|&&a, &&b| {
+                    let wa = adj[a]
+                        .iter()
+                        .filter(|&&(nbr, _)| nbr == cur)
+                        .map(|&(_, w)| w)
+                        .fold(0.0_f64, f64::max);
+                    let wb = adj[b]
+                        .iter()
+                        .filter(|&&(nbr, _)| nbr == cur)
+                        .map(|&(_, w)| w)
+                        .fold(0.0_f64, f64::max);
+                    wa.total_cmp(&wb).then_with(|| b.cmp(&a))
+                })?;
+            if let Some(w) = adj[p]
+                .iter()
+                .filter(|&&(nbr, _)| nbr == cur)
+                .map(|&(_, w)| w)
+                .reduce(f64::max)
+            {
                 bottleneck = bottleneck.min(w);
             }
             rev_indices.push(p);
@@ -446,7 +495,7 @@ impl ConnectomeAtlas {
             total_distance_cost: dist[t],
             bottleneck_weight: if bottleneck.is_finite() { bottleneck } else { 0.0 },
             arc_length_mm: arc_len_mm,
-            conduction_latency_ms: arc_len_mm / 9.6,
+            conduction_latency_ms: arc_len_mm / vel_m_s,
         })
     }
 
@@ -534,38 +583,148 @@ impl ConnectomeAtlas {
     }
 }
 
-fn dijkstra_from(
+/// Weighted Dijkstra + Brandes shortest-path DAG (`dist`, path counts `sigma`,
+/// tied predecessors `preds`, and non-decreasing distance settle `order`).
+pub(crate) fn dijkstra_brandes_from(
     start: usize,
     n: usize,
     adj: &[Vec<(usize, f64)>],
-) -> (Vec<f64>, Vec<Option<usize>>) {
+) -> (Vec<f64>, Vec<f64>, Vec<Vec<usize>>, Vec<usize>) {
     let mut dist = vec![f64::INFINITY; n];
-    let mut pred = vec![None; n];
+    let mut sigma = vec![0.0_f64; n];
+    let mut preds = vec![Vec::new(); n];
+    let mut order = Vec::with_capacity(n);
+    let mut settled = vec![false; n];
     let mut heap = BinaryHeap::new();
 
     dist[start] = 0.0;
+    sigma[start] = 1.0;
     heap.push(State {
         cost: 0.0,
         node: start,
     });
 
     while let Some(State { cost, node }) = heap.pop() {
-        if cost > dist[node] {
+        if settled[node] || cost > dist[node] + 1e-12 {
             continue;
         }
+        settled[node] = true;
+        order.push(node);
+
         for &(next, weight) in &adj[node] {
             let step_cost = 1.0 / weight.max(1e-6);
             let next_cost = cost + step_cost;
             if next_cost + 1e-12 < dist[next] {
                 dist[next] = next_cost;
-                pred[next] = Some(node);
+                sigma[next] = sigma[node];
+                preds[next].clear();
+                preds[next].push(node);
                 heap.push(State {
                     cost: next_cost,
                     node: next,
                 });
+            } else if (next_cost - dist[next]).abs() <= 1e-12 {
+                sigma[next] += sigma[node];
+                if !preds[next].contains(&node) {
+                    preds[next].push(node);
+                }
             }
         }
     }
 
-    (dist, pred)
+    (dist, sigma, preds, order)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::model::{
+        AtlasScale, BrainRegion, ConnectomeAtlas, Hemisphere, PathwayEdge, PathwayModality,
+        ReceptorProfile,
+    };
+    use crate::presets::human_mni152_atlas;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn brandes_tracks_tied_shortest_paths_symmetrically() {
+        let mk_reg = |id: &str, coord: [f32; 3]| BrainRegion {
+            id: id.to_string(),
+            name: id.to_string(),
+            network: "Net".to_string(),
+            hemisphere: Hemisphere::Midline,
+            coord,
+            radius_mm: 4.0,
+            color_hex: "#38bdf8".to_string(),
+            citation_url: String::new(),
+            notes: String::new(),
+            what_it_does: String::new(),
+            inputs_prose: String::new(),
+            outputs_prose: String::new(),
+            receptors: ReceptorProfile::default(),
+        };
+        let mk_edge = |s: &str, t: &str| PathwayEdge {
+            source: s.to_string(),
+            target: t.to_string(),
+            weight: 1.0,
+            tract_name: "T".to_string(),
+            modality: PathwayModality::Association,
+            directed: false,
+            synapse_count_est: None,
+        };
+        let diamond = ConnectomeAtlas {
+            id: "diamond".to_string(),
+            title: "Diamond".to_string(),
+            organism: "Test".to_string(),
+            coordinate_space: "Test".to_string(),
+            scale: AtlasScale::MacroParcellation,
+            reference_summary: String::new(),
+            primary_citation_url: String::new(),
+            benchmark_neurons_or_parcels: String::new(),
+            benchmark_synapses_or_tracts: String::new(),
+            conduction_velocity_m_s: 9.6,
+            regions: vec![
+                mk_reg("N0", [0.0, 0.0, 0.0]),
+                mk_reg("N1", [-10.0, 10.0, 0.0]),
+                mk_reg("N2", [10.0, 10.0, 0.0]),
+                mk_reg("N3", [0.0, 20.0, 0.0]),
+            ],
+            edges: vec![
+                mk_edge("N0", "N1"),
+                mk_edge("N0", "N2"),
+                mk_edge("N1", "N3"),
+                mk_edge("N2", "N3"),
+            ],
+            ablated_regions: BTreeSet::new(),
+            severed_tracts: BTreeSet::new(),
+        };
+        let summary = diamond.compute_summary_metrics(0.0);
+        let b0 = summary.node_metrics[0].betweenness_centrality;
+        let b1 = summary.node_metrics[1].betweenness_centrality;
+        let b2 = summary.node_metrics[2].betweenness_centrality;
+        let b3 = summary.node_metrics[3].betweenness_centrality;
+        // On a symmetric 4-cycle N0-N1-N3-N2, every vertex splits 2 tied paths (1.0 / 6.0)
+        assert!((b1 - b2).abs() < 1e-9, "Tied shortest paths must yield equal betweenness: {b1} vs {b2}");
+        assert!((b1 - (1.0 / 6.0)).abs() < 1e-9, "Expected 1/6, got {b1}");
+        assert!((b0 - b3).abs() < 1e-9 && (b0 - b1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn shortest_signaling_path_scales_latency_by_configured_velocity() {
+        let mut atlas = human_mni152_atlas();
+        let p_base = atlas
+            .shortest_signaling_path("LANG.Wernicke_L", "LANG.Broca_L", 0.0)
+            .expect("path exists");
+        atlas.conduction_velocity_m_s = 19.2;
+        let p_fast = atlas
+            .shortest_signaling_path("LANG.Wernicke_L", "LANG.Broca_L", 0.0)
+            .expect("path exists");
+        assert!(
+            (p_fast.conduction_latency_ms * 2.0 - p_base.conduction_latency_ms).abs() < 1e-9,
+            "Doubling velocity should halve latency: base={} fast={}",
+            p_base.conduction_latency_ms,
+            p_fast.conduction_latency_ms
+        );
+        let m_base = human_mni152_atlas().compute_summary_metrics(0.0);
+        let m_fast = atlas.compute_summary_metrics(0.0);
+        assert!((m_fast.mean_conduction_delay_ms * 2.0 - m_base.mean_conduction_delay_ms).abs() < 1e-9);
+    }
 }

@@ -27,7 +27,11 @@ pub use control_harmonics::{
     jacobi_eigen_symmetric, node_controllability_from_spectrum, normalize_adjacency_schur,
     ControlHarmonicsReport, NodeControlHarmonicMetrics,
 };
-pub use metrics::{AtlasSummaryMetrics, LesionDeltaReport, NodeTopologyMetrics, PathResult};
+pub use metrics::{
+    compute_all_presets_topology_digest, compute_comparative_topology_digest, AtlasSummaryMetrics,
+    ComparativeTopologyDigest, LesionDeltaReport, NodeTopologyMetrics, PathResult,
+    TopologyDigestEntry,
+};
 pub use model::{
     AtlasEnvelope, AtlasScale, BrainRegion, ConnectomeAtlas, DecColor, Hemisphere, PathwayEdge,
     PathwayModality, ReceptorProfile,

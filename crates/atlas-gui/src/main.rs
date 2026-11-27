@@ -20,7 +20,9 @@ mod app;
 mod icon;
 
 use app::{render_headless_screenshot, ConnectomeAtlasApp};
-use atlas_core::{all_presets, load_preset_by_id, AtlasEnvelope};
+use atlas_core::{
+    all_presets, compute_all_presets_topology_digest, load_preset_by_id, AtlasEnvelope,
+};
 use atlas_io::{format_swc_document, generate_region_swc_arbor};
 use clap::{Parser, Subcommand};
 use eframe::egui;
@@ -75,6 +77,18 @@ enum Commands {
         preset: String,
         #[arg(long, default_value_t = 0.0)]
         min_weight: f64,
+    },
+    /// Output comparative graph-topology digest (sigma, C, L, rich-club Phi, modularity Q)
+    TopologyDigest {
+        #[arg(long, default_value_t = 0.0)]
+        min_weight: f64,
+        #[arg(long, default_value_t = 1337)]
+        seed: u64,
+        /// Output format: json or csv
+        #[arg(long, default_value = "json")]
+        format: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Compute weighted shortest signaling path between two regions
     Path {
@@ -166,6 +180,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or_else(|| format!("Unknown preset '{preset}'"))?;
                 let tda = atlas.compute_topology_tda_report(min_weight);
                 println!("{}", serde_json::to_string_pretty(&tda)?);
+            }
+            Commands::TopologyDigest {
+                min_weight,
+                seed,
+                format,
+                out,
+            } => {
+                let digest = compute_all_presets_topology_digest(min_weight, seed);
+                let text = match format.to_ascii_lowercase().as_str() {
+                    "csv" => digest.to_csv(),
+                    "json" => digest.to_json_pretty()?,
+                    other => {
+                        return Err(format!("Unsupported format '{other}'; expected json or csv").into());
+                    }
+                };
+                if let Some(out_path) = out {
+                    std::fs::write(&out_path, &text)?;
+                    println!("Wrote topology digest ({format}) to {}", out_path.display());
+                } else {
+                    println!("{text}");
+                }
             }
             Commands::Path {
                 preset,

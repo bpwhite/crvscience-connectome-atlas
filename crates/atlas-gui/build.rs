@@ -68,7 +68,10 @@ fn main() {
         return;
     }
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let Ok(manifest_dir_str) = env::var("CARGO_MANIFEST_DIR") else {
+        return;
+    };
+    let manifest_dir = PathBuf::from(manifest_dir_str);
     let ico_path = manifest_dir.join("assets").join("connectome_atlas.ico");
     if !ico_path.is_file() {
         println!(
@@ -78,7 +81,10 @@ fn main() {
         return;
     }
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let Ok(out_dir_str) = env::var("OUT_DIR") else {
+        return;
+    };
+    let out_dir = PathBuf::from(out_dir_str);
     let rc_path = out_dir.join("connectome_atlas.rc");
     let ico_rc_str = ico_path.to_string_lossy().replace('\\', "/");
 

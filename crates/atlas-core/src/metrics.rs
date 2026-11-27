@@ -70,6 +70,93 @@ pub struct LesionDeltaReport {
     pub lesioned_components: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyDigestEntry {
+    pub preset_id: String,
+    pub organism: String,
+    pub active_nodes: usize,
+    pub active_edges: usize,
+    pub connected_components: usize,
+    pub global_efficiency: f64,
+    pub mean_clustering_coeff: f64,
+    pub characteristic_path_length: f64,
+    pub small_world_sigma: f64,
+    pub rich_club_coeff: f64,
+    pub rich_club_normalized: f64,
+    pub modularity_q: f64,
+    pub community_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComparativeTopologyDigest {
+    pub min_weight: f64,
+    pub seed: u64,
+    pub entries: Vec<TopologyDigestEntry>,
+}
+
+fn csv_escape_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+impl ComparativeTopologyDigest {
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    pub fn to_csv(&self) -> String {
+        let mut out = String::from(
+            "preset_id,organism,active_nodes,active_edges,connected_components,global_efficiency,mean_clustering_coeff,characteristic_path_length,small_world_sigma,rich_club_coeff,rich_club_normalized,modularity_q,community_count\n",
+        );
+        for e in &self.entries {
+            out.push_str(&format!(
+                "{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{}\n",
+                csv_escape_field(&e.preset_id),
+                csv_escape_field(&e.organism),
+                e.active_nodes,
+                e.active_edges,
+                e.connected_components,
+                e.global_efficiency,
+                e.mean_clustering_coeff,
+                e.characteristic_path_length,
+                e.small_world_sigma,
+                e.rich_club_coeff,
+                e.rich_club_normalized,
+                e.modularity_q,
+                e.community_count,
+            ));
+        }
+        out
+    }
+}
+
+pub fn compute_comparative_topology_digest(
+    atlases: &[ConnectomeAtlas],
+    min_weight: f64,
+    seed: u64,
+) -> ComparativeTopologyDigest {
+    let entries = atlases
+        .iter()
+        .map(|atlas| atlas.compute_topology_digest_entry(min_weight, seed))
+        .collect();
+    ComparativeTopologyDigest {
+        min_weight,
+        seed,
+        entries,
+    }
+}
+
+pub fn compute_all_presets_topology_digest(
+    min_weight: f64,
+    seed: u64,
+) -> ComparativeTopologyDigest {
+    let presets = crate::presets::all_presets();
+    compute_comparative_topology_digest(&presets, min_weight, seed)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct State {
     cost: f64,
@@ -581,6 +668,76 @@ impl ConnectomeAtlas {
             lesioned_components: current.connected_components,
         }
     }
+
+    /// Computes Newman weighted modularity `Q` over intact regions partitioned by `network`.
+    pub fn compute_modularity_q(&self, min_weight: f64) -> (f64, usize) {
+        let n = self.regions.len();
+        let mut idx_of = HashMap::with_capacity(n);
+        let mut active_communities = std::collections::BTreeSet::new();
+        for (i, r) in self.regions.iter().enumerate() {
+            idx_of.insert(r.id.as_str(), i);
+            if !self.ablated_regions.contains(&r.id) {
+                active_communities.insert(r.network.as_str());
+            }
+        }
+        let mut sym_w = vec![vec![0.0_f64; n]; n];
+        for e in &self.edges {
+            if !self.is_edge_intact(e, min_weight) || e.weight <= 0.0 {
+                continue;
+            }
+            if let (Some(&u), Some(&v)) = (
+                idx_of.get(e.source.as_str()),
+                idx_of.get(e.target.as_str()),
+            ) {
+                if u != v {
+                    sym_w[u][v] = sym_w[u][v].max(e.weight);
+                    sym_w[v][u] = sym_w[v][u].max(e.weight);
+                }
+            }
+        }
+        let strengths: Vec<f64> = (0..n).map(|i| sym_w[i].iter().sum()).collect();
+        let two_m: f64 = strengths.iter().sum();
+        if two_m <= 1e-12 {
+            return (0.0, active_communities.len());
+        }
+        let mut q_acc = 0.0_f64;
+        for i in 0..n {
+            if self.ablated_regions.contains(&self.regions[i].id) {
+                continue;
+            }
+            for j in 0..n {
+                if self.ablated_regions.contains(&self.regions[j].id) {
+                    continue;
+                }
+                if self.regions[i].network == self.regions[j].network {
+                    q_acc += sym_w[i][j] - (strengths[i] * strengths[j]) / two_m;
+                }
+            }
+        }
+        ((q_acc / two_m).clamp(-0.5, 1.0), active_communities.len())
+    }
+
+    /// Computes a single-connectome comparative graph-topology digest entry.
+    pub fn compute_topology_digest_entry(&self, min_weight: f64, seed: u64) -> TopologyDigestEntry {
+        let summary = self.compute_summary_metrics(min_weight);
+        let sys = self.compute_systems_neuro_report(min_weight, seed);
+        let (modularity_q, community_count) = self.compute_modularity_q(min_weight);
+        TopologyDigestEntry {
+            preset_id: self.id.clone(),
+            organism: self.organism.clone(),
+            active_nodes: summary.active_nodes,
+            active_edges: summary.active_edges,
+            connected_components: summary.connected_components,
+            global_efficiency: summary.global_efficiency,
+            mean_clustering_coeff: summary.mean_clustering,
+            characteristic_path_length: summary.characteristic_path_length,
+            small_world_sigma: sys.null_benchmark.small_world_sigma,
+            rich_club_coeff: summary.rich_club_coeff_top_quartile,
+            rich_club_normalized: sys.null_benchmark.rich_club_normalized,
+            modularity_q,
+            community_count,
+        }
+    }
 }
 
 /// Weighted Dijkstra + Brandes shortest-path DAG (`dist`, path counts `sigma`,
@@ -726,5 +883,115 @@ mod tests {
         let m_base = human_mni152_atlas().compute_summary_metrics(0.0);
         let m_fast = atlas.compute_summary_metrics(0.0);
         assert!((m_fast.mean_conduction_delay_ms * 2.0 - m_base.mean_conduction_delay_ms).abs() < 1e-9);
+    }
+
+    #[test]
+    fn modularity_q_is_positive_for_clustered_two_community_graph() {
+        let mk_reg = |id: &str, net: &str, coord: [f32; 3]| BrainRegion {
+            id: id.to_string(),
+            name: id.to_string(),
+            network: net.to_string(),
+            hemisphere: Hemisphere::Midline,
+            coord,
+            radius_mm: 4.0,
+            color_hex: "#38bdf8".to_string(),
+            citation_url: String::new(),
+            notes: String::new(),
+            what_it_does: String::new(),
+            inputs_prose: String::new(),
+            outputs_prose: String::new(),
+            receptors: ReceptorProfile::default(),
+        };
+        let mk_edge = |s: &str, t: &str, w: f64| PathwayEdge {
+            source: s.to_string(),
+            target: t.to_string(),
+            weight: w,
+            tract_name: "T".to_string(),
+            modality: PathwayModality::Association,
+            directed: false,
+            synapse_count_est: None,
+        };
+        let atlas = ConnectomeAtlas {
+            id: "two_comm".to_string(),
+            title: "TwoComm".to_string(),
+            organism: "Test".to_string(),
+            coordinate_space: "Test".to_string(),
+            scale: AtlasScale::MacroParcellation,
+            reference_summary: String::new(),
+            primary_citation_url: String::new(),
+            benchmark_neurons_or_parcels: String::new(),
+            benchmark_synapses_or_tracts: String::new(),
+            conduction_velocity_m_s: 9.6,
+            regions: vec![
+                mk_reg("A1", "Alpha", [0.0, 0.0, 0.0]),
+                mk_reg("A2", "Alpha", [5.0, 0.0, 0.0]),
+                mk_reg("A3", "Alpha", [0.0, 5.0, 0.0]),
+                mk_reg("B1", "Beta", [30.0, 0.0, 0.0]),
+                mk_reg("B2", "Beta", [35.0, 0.0, 0.0]),
+                mk_reg("B3", "Beta", [30.0, 5.0, 0.0]),
+            ],
+            edges: vec![
+                mk_edge("A1", "A2", 1.0),
+                mk_edge("A2", "A3", 1.0),
+                mk_edge("A1", "A3", 1.0),
+                mk_edge("B1", "B2", 1.0),
+                mk_edge("B2", "B3", 1.0),
+                mk_edge("B1", "B3", 1.0),
+                mk_edge("A1", "B1", 0.2),
+            ],
+            ablated_regions: BTreeSet::new(),
+            severed_tracts: BTreeSet::new(),
+        };
+        let (q, comms) = atlas.compute_modularity_q(0.0);
+        assert_eq!(comms, 2);
+        assert!(q > 0.35 && q <= 1.0, "Expected strongly positive modularity Q, got {q}");
+    }
+
+    #[test]
+    fn comparative_topology_digest_covers_all_four_presets_and_exports_json_csv() {
+        let digest = crate::compute_all_presets_topology_digest(0.0, 1337);
+        assert_eq!(digest.entries.len(), 4);
+        for e in &digest.entries {
+            assert!(e.active_nodes >= 20);
+            assert!(e.active_edges >= 30);
+            assert!(e.small_world_sigma.is_finite() && e.small_world_sigma > 0.0);
+            assert!(e.mean_clustering_coeff.is_finite() && e.mean_clustering_coeff >= 0.0);
+            assert!(e.characteristic_path_length.is_finite() && e.characteristic_path_length > 0.0);
+            assert!(e.rich_club_coeff.is_finite() && e.rich_club_coeff >= 0.0);
+            assert!(e.modularity_q.is_finite() && e.modularity_q >= -0.5 && e.modularity_q <= 1.0);
+            assert!(e.community_count >= 4);
+        }
+
+        let json = digest.to_json_pretty().expect("serialize digest json");
+        let parsed: crate::ComparativeTopologyDigest =
+            serde_json::from_str(&json).expect("roundtrip digest json");
+        assert_eq!(parsed.entries.len(), 4);
+
+        let csv = digest.to_csv();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].contains("small_world_sigma"));
+        assert!(lines[0].contains("modularity_q"));
+        assert!(lines[0].contains("rich_club_coeff"));
+    }
+
+    #[test]
+    fn lesion_alters_topology_digest_entry_and_csv_escapes_commas() {
+        let mut human = human_mni152_atlas();
+        let intact = human.compute_topology_digest_entry(0.0, 1337);
+        human.toggle_region_ablation("LANG.Broca_L");
+        let lesioned = human.compute_topology_digest_entry(0.0, 1337);
+        assert_eq!(lesioned.active_nodes + 1, intact.active_nodes);
+        assert!(lesioned.global_efficiency < intact.global_efficiency);
+
+        let mut custom = intact.clone();
+        custom.organism = "Homo sapiens, MNI152".to_string();
+        let digest = crate::ComparativeTopologyDigest {
+            min_weight: 0.0,
+            seed: 1337,
+            entries: vec![custom],
+        };
+        let csv = digest.to_csv();
+        assert!(csv.contains("\"Homo sapiens, MNI152\""));
     }
 }

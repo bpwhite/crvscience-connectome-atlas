@@ -29,6 +29,9 @@ pub enum CommandAction {
     ExportSelectedSwc,
     TuneCriticalityKappa(i32),
     InspectPersistentCavities,
+    InspectTopologyDigest,
+    ExportTopologyDigestJson,
+    ExportTopologyDigestCsv,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +179,24 @@ pub fn build_command_index(atlas: &ConnectomeAtlas) -> Vec<CommandEntry> {
             "Write SHA-256 verified connectome-atlas-v1 JSON",
             CommandAction::ExportEnvelopeJson,
         ),
+        (
+            "Topology",
+            "Comparative Connectome Graph-Topology Digest",
+            "Inspect sigma, clustering C, path length L, rich-club Phi, and modularity Q across presets",
+            CommandAction::InspectTopologyDigest,
+        ),
+        (
+            "Export",
+            "Export Comparative Topology Digest (.json)",
+            "Write comparative small-world, rich-club, and modularity Q digest JSON",
+            CommandAction::ExportTopologyDigestJson,
+        ),
+        (
+            "Export",
+            "Export Comparative Topology Digest (.csv)",
+            "Write comparative small-world, rich-club, and modularity Q digest CSV",
+            CommandAction::ExportTopologyDigestCsv,
+        ),
     ];
 
     for (cat, title, sub, act) in builtins {
@@ -250,5 +271,17 @@ mod tests {
         let zen_hits = search_command_index(&idx, "zen", 5);
         assert!(!zen_hits.is_empty());
         assert_eq!(zen_hits[0].action, CommandAction::ToggleZenMode);
+    }
+
+    #[test]
+    fn command_index_includes_topology_digest_actions() {
+        let human = load_preset_by_id("human_mni152").expect("human preset");
+        let idx = build_command_index(&human);
+        let hits = search_command_index(&idx, "modularity", 5);
+        assert!(hits.iter().any(|h| matches!(h.action, CommandAction::InspectTopologyDigest)));
+        let csv_hits = search_command_index(&idx, "digest csv", 5);
+        assert!(csv_hits.iter().any(|h| matches!(h.action, CommandAction::ExportTopologyDigestCsv)));
+        let json_hits = search_command_index(&idx, "digest json", 5);
+        assert!(json_hits.iter().any(|h| matches!(h.action, CommandAction::ExportTopologyDigestJson)));
     }
 }

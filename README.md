@@ -72,6 +72,7 @@ Viewport single-key hotkeys (`1–4`, `R`, `I`, `P`, `L`, `C`, `Z`) are guarded 
 | `metrics` | `--preset <ID>` | Output JSON structural network summary metrics |
 | `criticality` | `--preset <ID> --kappa <F64>` (default `1.0`) | Output JSON Kinouchi–Copelli branching ratio `sigma` and dynamic range `Delta` |
 | `topology` | `--preset <ID> --min-weight <F64>` (default `0.0`) | Output JSON clique complex & Z2 `beta_1` persistent homology report |
+| `topology-digest` | `--min-weight <F64> --seed <U64> --format <json\|csv> [--out <PATH>]` | Export comparative small-world, rich-club, and modularity `Q` digest across presets |
 | `path` | `--preset <ID> --from <ID> --to <ID> --velocity <F64>` (default `9.6`) | Output JSON shortest weighted signaling path & velocity-scaled latency |
 | `lesion` | `--preset <ID> [--tract <NAME>] [--region <ID>]` | Output JSON `LesionDeltaReport` efficiency retention & component count |
 | `export-json` | `--preset <ID> --out <PATH>` | Write SHA-256 verified `.connectome.json` envelope |
@@ -90,6 +91,7 @@ Viewport single-key hotkeys (`1–4`, `R`, `I`, `P`, `L`, `C`, `Z`) are guarded 
 | `harmonics` | `--preset --top-modes` | Print normalized Graph Laplacian harmonic wavenumbers `omega_k` |
 | `criticality` | `--preset --kappa` | Compute directed/undirected E/I branching ratio `sigma` and dynamic range `Delta` (dB) |
 | `topology` | `--preset --min-weight` | Enumerate `3`/`4`-cliques and exact Z2 persistent `beta_1` cavities |
+| `topology-digest` | `--min-weight --seed --format --out` | Comparative graph-topology digest (`sigma`, `C`, `L`, rich-club `Phi`, modularity `Q`) in table/JSON/CSV |
 | `synergy` | `--preset` | Compute PhiID synergy-redundancy rank, metabolic economy, and `|r(SST-PVALB, G1)|` |
 | `null-benchmark` | `--preset --seed` | Run Maslov–Sneppen null ensemble `(C/C0)/(L/L0)` & Betzel–Sporns generative fit |
 | `decode-lesion` | `--preset [--ablate] [--sever-tract]` | Decode cognitive/motor domain recruitment or `%` lesion disruption |
@@ -129,7 +131,7 @@ Observed workspace artifacts and test suite status (from `validation/connectome_
   - View 1 (`human_mni152`): `validation/headless_screenshot.png` (`720,314` bytes)
   - View 2 (`drosophila_flywire`): `validation/headless_screenshot_2.png` (`397,657` bytes)
   - View 3 (`celegans_wormatlas`): `validation/headless_screenshot_3.png` (`403,864` bytes)
-- **Workspace Test Suite (`cargo test --workspace`)**: **`22 passed; 0 failed`** (`atlas_core`: `11 passed; 0 failed`, `atlas_gui`: `6 passed; 0 failed`, `atlas_render`: `3 passed; 0 failed`, `atlas_io`: `2 passed; 0 failed`, `atlas_cli`: `0 tests`; baseline snapshot in `validation/connectome_atlas_validation_summary.json` recorded `12/12` passing prior to these upgrades).
+- **Workspace Test Suite (`cargo test --workspace`)**: **`29 passed; 0 failed`** (`atlas_core`: `15 passed; 0 failed`, `atlas_gui`: `8 passed; 0 failed`, `atlas_render`: `3 passed; 0 failed`, `atlas_io`: `2 passed; 0 failed`, `atlas_cli`: `1 passed; 0 failed`; baseline snapshot in `validation/connectome_atlas_validation_summary.json` recorded `12/12` passing prior to these upgrades).
 
 ---
 

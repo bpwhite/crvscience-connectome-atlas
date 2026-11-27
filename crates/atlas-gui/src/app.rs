@@ -14,10 +14,10 @@
 // along with this program.  If not, see <https://gnu.org>.
 
 use atlas_core::{
-    all_presets, build_command_index, search_command_index, AtlasEnvelope, AtlasSummaryMetrics,
-    CommandAction, CommandEntry, ConnectomeAtlas, ControlHarmonicsReport, CriticalityReport,
-    DecColor, DomainDecodeEntry, LesionDeltaReport, PathResult, SystemsNeuroReport,
-    TopologyTdaReport,
+    all_presets, build_command_index, compute_comparative_topology_digest, search_command_index,
+    AtlasEnvelope, AtlasSummaryMetrics, CommandAction, CommandEntry, ComparativeTopologyDigest,
+    ConnectomeAtlas, ControlHarmonicsReport, CriticalityReport, DecColor, DomainDecodeEntry,
+    LesionDeltaReport, PathResult, SystemsNeuroReport, TopologyTdaReport,
 };
 use atlas_io::{parse_nifti1_header, parse_swc_morphology, parse_trk_streamlines, AtlasVault};
 use atlas_io::{format_swc_document, generate_region_swc_arbor};
@@ -57,6 +57,7 @@ pub struct ConnectomeAtlasApp {
     lesion_delta: LesionDeltaReport,
     control_harmonics: ControlHarmonicsReport,
     systems_neuro: SystemsNeuroReport,
+    topology_digest: ComparativeTopologyDigest,
     criticality_kappa: f64,
     criticality: CriticalityReport,
     topology_tda: TopologyTdaReport,
@@ -169,6 +170,7 @@ impl ConnectomeAtlasApp {
         };
         let control_harmonics = atlas.compute_control_and_harmonics(0.0, "ht", 0.0);
         let systems_neuro = atlas.compute_systems_neuro_report(0.0, 1337);
+        let topology_digest = compute_comparative_topology_digest(&presets, 0.0, 1337);
         let criticality = atlas.compute_criticality_report(0.0, 1.0);
         let topology_tda = atlas.compute_topology_tda_report(0.0);
         let domain_decode = atlas.decode_functional_domains(None, 0.0);
@@ -207,6 +209,7 @@ impl ConnectomeAtlasApp {
             lesion_delta,
             control_harmonics,
             systems_neuro,
+            topology_digest,
             criticality_kappa: 1.0,
             criticality,
             topology_tda,
@@ -280,6 +283,11 @@ impl ConnectomeAtlasApp {
         self.harmonic_mode_idx = self.harmonic_mode_idx.clamp(1, max_h);
         self.fiber_tensors = compute_atlas_fiber_tensors(&self.atlas, self.min_weight);
         self.systems_neuro = self.atlas.compute_systems_neuro_report(self.min_weight, 1337);
+        let mut digest_atlases = self.presets.clone();
+        if let Some(slot) = digest_atlases.get_mut(self.active_preset_idx) {
+            *slot = self.atlas.clone();
+        }
+        self.topology_digest = compute_comparative_topology_digest(&digest_atlases, self.min_weight, 1337);
         self.criticality = self
             .atlas
             .compute_criticality_report(self.min_weight, self.criticality_kappa);
@@ -521,6 +529,50 @@ impl ConnectomeAtlasApp {
         }
     }
 
+    fn export_topology_digest_dialog(&mut self, is_csv: bool) {
+        let (default_name, filter_lbl, ext, payload_res) = if is_csv {
+            (
+                "connectome_topology_digest.csv",
+                "CSV Table",
+                "csv",
+                Ok(self.topology_digest.to_csv()),
+            )
+        } else {
+            (
+                "connectome_topology_digest.json",
+                "JSON Digest",
+                "json",
+                self.topology_digest
+                    .to_json_pretty()
+                    .map_err(|e| format!("JSON serialize error: {e}")),
+            )
+        };
+        let payload = match payload_res {
+            Ok(txt) => txt,
+            Err(e) => {
+                self.status_msg = e;
+                return;
+            }
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(filter_lbl, &[ext])
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&path, payload) {
+            Ok(()) => {
+                self.status_msg = format!(
+                    "Exported comparative topology digest ({}) to {}",
+                    ext.to_uppercase(),
+                    path.display()
+                );
+            }
+            Err(e) => self.status_msg = format!("Digest export failed: {e}"),
+        }
+    }
+
     fn execute_command_action(&mut self, act: CommandAction, animate: bool) {
         match act {
             CommandAction::JumpToRegion(rid) => {
@@ -604,6 +656,21 @@ impl ConnectomeAtlasApp {
                     "Inspecting {} persistent beta-1 topological cavities.",
                     self.topology_tda.persistent_beta1_count
                 );
+            }
+            CommandAction::InspectTopologyDigest => {
+                self.zen_mode = false;
+                self.show_right_panel = true;
+                self.right_tab = RightTab::RichClubHubs;
+                self.status_msg = format!(
+                    "Viewing comparative topology digest ({} presets).",
+                    self.topology_digest.entries.len()
+                );
+            }
+            CommandAction::ExportTopologyDigestJson => {
+                self.export_topology_digest_dialog(false);
+            }
+            CommandAction::ExportTopologyDigestCsv => {
+                self.export_topology_digest_dialog(true);
             }
         }
     }
@@ -1836,16 +1903,54 @@ impl ConnectomeAtlasApp {
 
     fn ui_hubs(&mut self, ui: &mut egui::Ui) {
         let nb = &self.systems_neuro.null_benchmark;
+        let (mod_q, mod_comms) = self.atlas.compute_modularity_q(self.min_weight);
         ui.group(|ui| {
             ui.label(egui::RichText::new(format!(
-                "Economy E/C: {:.2} | Small-World sigma: {:.2}x | Rich-Club Phi_norm: {:.2}x",
-                self.systems_neuro.economy_efficiency_ratio, nb.small_world_sigma, nb.rich_club_normalized
+                "Economy E/C: {:.2} | Small-World sigma: {:.2}x | Rich-Club Phi_norm: {:.2}x | Modularity Q: {:.3} ({} net)",
+                self.systems_neuro.economy_efficiency_ratio, nb.small_world_sigma, nb.rich_club_normalized, mod_q, mod_comms
             )).small());
             ui.label(egui::RichText::new(format!(
                 "Wiring Cost vs Null: {:+.1}% | Generative (eta*={:.1}, gamma*={:.1}) | |r(mRNA,G1)|={:.2}",
                 nb.wiring_cost_saving_pct, nb.generative_eta_distance, nb.generative_gamma_homophily, self.systems_neuro.transcriptomic_g1_pearson_r
             )).small().color(Color32::from_rgb(45, 212, 191)));
         });
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new("Comparative Connectome Graph-Topology Digest")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.small_button("Export Digest JSON...").clicked() {
+                        self.export_topology_digest_dialog(false);
+                    }
+                    if ui.small_button("Export Digest CSV...").clicked() {
+                        self.export_topology_digest_dialog(true);
+                    }
+                });
+                egui::Grid::new("comparative_topology_digest_grid").striped(true).show(ui, |ui| {
+                    ui.strong("Preset");
+                    ui.strong("Sigma");
+                    ui.strong("Clust C");
+                    ui.strong("Path L");
+                    ui.strong("RC Phi");
+                    ui.strong("Mod Q");
+                    ui.end_row();
+                    for e in &self.topology_digest.entries {
+                        let is_cur = e.preset_id == self.atlas.id;
+                        let lbl = if is_cur {
+                            egui::RichText::new(&e.preset_id).strong().color(Color32::from_rgb(56, 189, 248))
+                        } else {
+                            egui::RichText::new(&e.preset_id)
+                        };
+                        ui.label(lbl);
+                        ui.label(format!("{:.2}", e.small_world_sigma));
+                        ui.label(format!("{:.3}", e.mean_clustering_coeff));
+                        ui.label(format!("{:.2}", e.characteristic_path_length));
+                        ui.label(format!("{:.3}", e.rich_club_coeff));
+                        ui.label(format!("{:.3}", e.modularity_q));
+                        ui.end_row();
+                    }
+                });
+            });
         ui.add_space(4.0);
         let mut sorted = self.metrics.node_metrics.clone();
         sorted.sort_by(|a, b| b.strength_total.total_cmp(&a.strength_total));
@@ -1914,6 +2019,12 @@ impl ConnectomeAtlasApp {
             }
             if ui.button("Export .connectome.json Envelope...").clicked() {
                 self.export_envelope_dialog();
+            }
+            if ui.button("Export Topology Digest JSON...").clicked() {
+                self.export_topology_digest_dialog(false);
+            }
+            if ui.button("Export Topology Digest CSV...").clicked() {
+                self.export_topology_digest_dialog(true);
             }
         });
         ui.separator();
@@ -3360,5 +3471,26 @@ mod tests {
             let out = ctx.run(raw, |ctx| app.ui_step(ctx, false));
             assert!(!out.shapes.is_empty());
         }
+    }
+
+    #[test]
+    fn command_palette_inspect_topology_digest_switches_to_hubs_tab() {
+        let mut app = ConnectomeAtlasApp::new_headless(0);
+        assert_eq!(app.topology_digest.entries.len(), 4);
+        app.right_tab = RightTab::Inspector;
+        app.execute_command_action(CommandAction::InspectTopologyDigest, false);
+        assert_eq!(app.right_tab, RightTab::RichClubHubs);
+        assert!(!app.zen_mode);
+        assert!(app.show_right_panel);
+    }
+
+    #[test]
+    fn recompute_refreshes_active_preset_in_topology_digest_after_lesion() {
+        let mut app = ConnectomeAtlasApp::new_headless(0);
+        let before_eff = app.topology_digest.entries[0].global_efficiency;
+        app.atlas.toggle_tract_sever("Corpus Callosum");
+        app.recompute();
+        let after_eff = app.topology_digest.entries[0].global_efficiency;
+        assert!(after_eff < before_eff);
     }
 }

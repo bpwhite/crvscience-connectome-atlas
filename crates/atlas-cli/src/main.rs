@@ -15,7 +15,10 @@
 
 #![forbid(unsafe_code)]
 
-use atlas_core::{all_presets, build_command_index, load_preset_by_id, search_command_index, AtlasEnvelope};
+use atlas_core::{
+    all_presets, build_command_index, compute_all_presets_topology_digest, load_preset_by_id,
+    search_command_index, AtlasEnvelope,
+};
 use atlas_io::{format_swc_document, generate_region_swc_arbor, parse_nifti1_header, parse_trk_streamlines, AtlasVault};
 use atlas_render::compute_atlas_fiber_tensors;
 use clap::{Parser, Subcommand};
@@ -100,6 +103,19 @@ enum Commands {
         preset: String,
         #[arg(long, default_value_t = 0.0)]
         min_weight: f64,
+    },
+    /// Compute comparative graph-topology digest (sigma, C, L, rich-club Phi, modularity Q) across all presets
+    TopologyDigest {
+        #[arg(long, default_value_t = 0.0)]
+        min_weight: f64,
+        #[arg(long, default_value_t = 1337)]
+        seed: u64,
+        /// Output format: table, json, or csv
+        #[arg(long, default_value = "table")]
+        format: String,
+        /// Optional path to write JSON or CSV output
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Compute Synergy-Redundancy (PhiID), Metabolic Wiring Economy & Transcriptomic G1 correlation
     Synergy {
@@ -376,6 +392,20 @@ Top Rich-Club Hubs:");
                 );
             }
         }
+        Commands::TopologyDigest {
+            min_weight,
+            seed,
+            format,
+            out,
+        } => {
+            let text = format_topology_digest(min_weight, seed, &format)?;
+            if let Some(out_path) = out {
+                fs::write(&out_path, &text)?;
+                println!("Wrote comparative topology digest ({format}) to {}", out_path.display());
+            } else {
+                println!("{text}");
+            }
+        }
         Commands::Synergy { preset } => {
             let atlas = load_preset_by_id(&preset)
                 .ok_or_else(|| format!("Unknown preset '{preset}'"))?;
@@ -552,4 +582,60 @@ Top Rich-Club Hubs:");
         }
     }
     Ok(())
+}
+
+fn format_topology_digest(
+    min_weight: f64,
+    seed: u64,
+    format: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let digest = compute_all_presets_topology_digest(min_weight, seed);
+    match format.to_ascii_lowercase().as_str() {
+        "json" => Ok(digest.to_json_pretty()?),
+        "csv" => Ok(digest.to_csv()),
+        "table" => {
+            let mut out = format!(
+                "Comparative Connectome Graph-Topology Digest (min_weight={min_weight:.2}, seed={seed}):\n"
+            );
+            out.push_str(&format!(
+                "{:<20} {:>5} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8}\n",
+                "Preset", "Nodes", "Edges", "Sigma", "Clust C", "Path L", "RC Phi", "Mod Q"
+            ));
+            for e in &digest.entries {
+                out.push_str(&format!(
+                    "{:<20} {:>5} {:>5} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3}\n",
+                    e.preset_id,
+                    e.active_nodes,
+                    e.active_edges,
+                    e.small_world_sigma,
+                    e.mean_clustering_coeff,
+                    e.characteristic_path_length,
+                    e.rich_club_coeff,
+                    e.modularity_q,
+                ));
+            }
+            Ok(out)
+        }
+        other => Err(format!("Unsupported format '{other}'; expected table, json, or csv").into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_format_topology_digest_supports_table_json_and_csv() {
+        let tbl = format_topology_digest(0.0, 1337, "table").expect("table digest");
+        assert!(tbl.contains("human_mni152"));
+        assert!(tbl.contains("Mod Q"));
+
+        let json = format_topology_digest(0.0, 1337, "json").expect("json digest");
+        assert!(json.contains("\"modularity_q\""));
+        assert!(json.contains("\"small_world_sigma\""));
+
+        let csv = format_topology_digest(0.0, 1337, "csv").expect("csv digest");
+        assert_eq!(csv.lines().count(), 5);
+        assert!(format_topology_digest(0.0, 1337, "xml").is_err());
+    }
 }

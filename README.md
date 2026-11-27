@@ -6,6 +6,8 @@ Standalone `#![forbid(unsafe_code)]`-core 3D Brain & Multi-Scale Connectome Atla
 - **License**: GNU General Public License v3.0 or later (`GPL-3.0-or-later`, see [LICENSE](LICENSE))
 - **Guides**: [User Guide](docs/USER_GUIDE.md) · [Scientific Methods](docs/SCIENTIFIC_METHODS.md) · [Preprints](Preprints/README.md)
 
+![ConnectomeAtlas Workbench](validation/headless_screenshot.png)
+
 ---
 
 ## Build & Run Quickstart

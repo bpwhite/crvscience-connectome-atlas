@@ -14,6 +14,8 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Bryan P. White <crvscience.com>"]
 description = "Standalone 3D Brain & Multi-Scale Connectome Atlas Workstation in Safe Rust"
+homepage = "https://crvscience.com/apps"
+repository = "https://github.com/bpwhite/crvscience-connectome-atlas"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
